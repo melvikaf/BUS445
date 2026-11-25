@@ -1,0 +1,262 @@
+---
+title: "Cell2Cell | Data cleaning and shared split"
+output:
+  html_document:
+    code_folding: hide
+---
+
+We used the supplied Cell2Cell CSV, a cross-sectional record of customer usage,
+billing, service, equipment, and retention history. The file contains 51,047
+customers and 58 fields, including 14,711 recorded churners (28.8%). The case
+dictionary describes approximately 71,000 customers. The supplied file defines
+the analysis sample. The binary churn outcome has no verified prediction
+horizon, so its sample rate cannot be read as monthly churn.
+
+The business question is which customers to review first when the retention
+team has limited outreach capacity. Cleaning keeps the recorded values and
+their units traceable across model comparisons.
+
+The churn label describes the recorded observation period. In the raw CSV,
+`Yes` means the customer left and `No` means they stayed during that period.
+
+## Data preparation
+
+```{r audit}
+customers <- read.csv(
+  "Provided_Data/cell2celltrain.csv",
+  na.strings = c("", "NA"), stringsAsFactors = FALSE
+)
+
+stopifnot(!anyNA(customers$CustomerID),
+          anyDuplicated(customers$CustomerID) == 0L,
+          !anyNA(customers$Churn),
+          setequal(unique(customers$Churn), c("No", "Yes")))
+
+knitr::kable(
+  data.frame(
+    Customers = nrow(customers),
+    Fields = ncol(customers),
+    `Duplicate rows` = sum(duplicated(customers)),
+    check.names = FALSE
+  ),
+  caption = "Source file at a glance",
+  format.args = list(big.mark = ",")
+)
+churn_label <- factor(customers$Churn, levels = c("No", "Yes"),
+                      labels = c("Did not churn", "Churned"))
+knitr::kable(as.data.frame(table(churn_label)),
+             col.names = c("Observed churn outcome", "Customers"),
+             format.args = list(big.mark = ","))
+
+missing <- sort(colSums(is.na(customers)), decreasing = TRUE)
+```
+
+### Imported fields and missing counts
+
+```{r imported-fields}
+knitr::kable(data.frame(
+  field = names(missing),
+  imported_type = vapply(customers[names(missing)], class, character(1)),
+  missing = unname(missing),
+  row.names = NULL
+), col.names = c("Field", "Imported type", "Missing cells"))
+```
+
+```{r source-flags}
+source_flags <- c(
+  unknown_handset_price = sum(customers$HandsetPrice == "Unknown", na.rm = TRUE),
+  zero_age_hh1 = sum(customers$AgeHH1 == 0, na.rm = TRUE),
+  zero_age_hh2 = sum(customers$AgeHH2 == 0, na.rm = TRUE),
+  negative_equipment_days = sum(customers$CurrentEquipmentDays < 0, na.rm = TRUE),
+  negative_monthly_revenue = sum(customers$MonthlyRevenue < 0, na.rm = TRUE)
+)
+knitr::kable(
+  data.frame(
+    Check = c("Unknown handset prices", "Zero primary household ages",
+              "Zero secondary household ages", "Negative equipment days",
+              "Negative monthly revenue"),
+    Customers = unname(source_flags)
+  ),
+  caption = "Source values flagged for review",
+  format.args = list(big.mark = ",")
+)
+```
+
+### Cleaning rules
+
+| Item | What happened in the shared dataset | Why |
+|---|---|---|
+| Blank fields and literal `NA` tokens | Set to R's `NA` when reading the source CSV through `na.strings = c("", "NA")`. | They represent unavailable values. |
+| `HandsetPrice` | Set all 28,982 cells containing the literal text `Unknown` to R's `NA`, then converted the column to numeric USD. The resulting missing prices are numeric `NA` values. | Recorded prices can now be summarized and modeled as amounts. |
+| `CurrentEquipmentDays` | Replaced negative values with `NA`. | Elapsed time with a handset must be zero or positive. |
+| Zero household ages | Flagged for review and kept as recorded. | The meaning of zero is unverified, and age is outside the current predictor sets. |
+| Negative monthly revenue | Flagged for review and kept in USD. | Signed amounts may reflect billing adjustments. |
+| Scaling and clipping | Kept original units. No z-score standardization, min–max normalization, or outlier clipping was applied. | The current unpenalized logistic models can fit predictors in different units. Original units make revenue, tenure, and usage easier to interpret. |
+| Customer records | Checked that customer IDs were unique and that every row had a valid churn label. Kept all rows. | Records with missing predictors can still contribute valid data. |
+
+```{r clean}
+prepared <- customers
+price <- prepared$HandsetPrice
+price[which(price == "Unknown")] <- NA
+prepared$HandsetPrice <- as.numeric(price)
+stopifnot(all(is.na(price) == is.na(prepared$HandsetPrice)))
+
+invalid_equipment <- which(prepared$CurrentEquipmentDays < 0)
+prepared$CurrentEquipmentDays[invalid_equipment] <- NA
+missing_after_cleaning <- sort(colSums(is.na(prepared)), decreasing = TRUE)
+```
+
+### Cleaned fields and missing counts
+
+```{r cleaned-fields}
+knitr::kable(data.frame(
+  field = names(missing_after_cleaning),
+  cleaned_type = vapply(prepared[names(missing_after_cleaning)], class, character(1)),
+  missing_after_cleaning = unname(missing_after_cleaning),
+  row.names = NULL
+), col.names = c("Field", "Cleaned type", "Missing cells"))
+```
+
+### Before and after cleaning
+
+The field-level table counts missing cells. The customer-level table counts
+each customer once if any field is missing.
+
+```{r cleaning-impact}
+source_tokens <- read.csv("Provided_Data/cell2celltrain.csv",
+                          colClasses = "character", na.strings = NULL)
+knitr::kable(data.frame(
+  source_encoding = c("Empty field", "Literal NA"),
+  imported_as_na = c(sum(source_tokens == "", na.rm = TRUE),
+                     sum(source_tokens == "NA", na.rm = TRUE))
+))
+knitr::kable(data.frame(
+  field = c("HandsetPrice", "CurrentEquipmentDays"),
+  newly_marked_missing = c(sum(customers$HandsetPrice == "Unknown", na.rm = TRUE),
+                           length(invalid_equipment)),
+  missing_before = unname(missing[c("HandsetPrice", "CurrentEquipmentDays")]),
+  missing_after = unname(missing_after_cleaning[c("HandsetPrice", "CurrentEquipmentDays")])
+))
+knitr::kable(data.frame(
+  measure = c("Customer rows", "Cells marked missing", "Rows with any missing field"),
+  before = c(nrow(customers), sum(missing), sum(!complete.cases(customers))),
+  after = c(nrow(prepared), sum(missing_after_cleaning), sum(!complete.cases(prepared)))
+))
+```
+
+### What this means
+
+Before cleaning, `HandsetPrice` had **0 cells counted as missing** because
+the source encoded 28,982 unavailable prices as the literal text `Unknown`.
+R counted that text as a recorded value. After replacing each `Unknown` with
+R's `NA`, the missing-price count rose to **28,982**. Those prices were
+already unavailable in the source data. Cleaning made that explicit.
+
+For `CurrentEquipmentDays`, the missing count rose from **1 to 77** because
+76 negative values were replaced with `NA`. Together, these two changes
+account for the increase from **3,515 to 32,573** cells counted as missing.
+
+### Where missing values are filled
+
+R stores missing values as `NA`. The export uses `write.csv(..., na = "")`,
+so those cells appear as empty fields in the shared CSV. EDA reports missingness
+where applicable. In `03_Variable_Selection.Rmd`, each cross-validation fit
+fills missing numeric predictors with the median of observed values in that
+fold's fitting rows. For example, a missing handset price in a validation row
+gets the median recorded price from the fitting rows. Missing categorical
+predictors use the most frequent category in the fitting rows. These temporary
+replacements apply to both fitting and validation data and stay inside the
+modeling step. This prevents validation data from influencing imputation.
+
+### Field consistency checks
+
+```{r consistency}
+knitr::kable(data.frame(
+  check = c("Active lines exceed unique lines", "Zero usage with positive dropped calls",
+            "Combined network count differs from sum by more than 0.1"),
+  flagged = with(prepared, c(
+    sum(ActiveSubs > UniqueSubs, na.rm = TRUE),
+    sum(MonthlyMinutes == 0 & DroppedCalls > 0, na.rm = TRUE),
+    sum(abs(DroppedBlockedCalls - DroppedCalls - BlockedCalls) > 0.1, na.rm = TRUE)
+  )),
+  comparable = with(prepared, c(
+    sum(complete.cases(ActiveSubs, UniqueSubs)),
+    sum(complete.cases(MonthlyMinutes, DroppedCalls)),
+    sum(complete.cases(DroppedBlockedCalls, DroppedCalls, BlockedCalls))
+  ))
+))
+```
+
+### What this means
+
+These checks flag where engineered features need guards or where measurement
+windows need confirmation. The original source fields remain available.
+There are 12 records with zero monthly minutes and positive dropped calls.
+The combined network count differs from the sum of the two component
+counts by more than 0.1 in 5,695 records. We compare it as an alternate
+predictor and keep the source measurements available for review.
+The case dictionary identifies zero secondary household age as possible for
+single-person households. Training-only missingness comparisons appear in
+`02_EDA.Rmd`.
+
+### Seasonality and calendar dates
+
+The case dictionary describes one cross-sectional record per customer. The
+CSV has no observation date, billing period, or churn event date. The
+quarter-over-quarter change fields show the direction and size of a change
+but do not identify calendar quarters. `MonthsInService` measures elapsed
+tenure. A change by tenure cannot be assigned to November or Black Friday.
+Testing seasonality would require dated customer billing or usage records
+spanning multiple periods. Daily or weekly dates would be needed to isolate
+Black Friday from the rest of November.
+
+## Shared training, test, and cross-validation assignments
+
+We use a 75/25 split stratified by churn and three stratified CV folds
+within training, with seed 445 for each assignment. This preserves the
+assignments used in the preliminary analysis. The test partition has a blank
+CV fold. For fold 1, the model fits on folds 2 and 3 and scores fold 1. Each
+training fold serves as validation once. The test partition is reserved
+for final evaluation after the team locks the model and predictors.
+
+```{r split-and-export}
+set.seed(445)
+by_churn <- split(seq_len(nrow(prepared)), prepared$Churn)
+train_rows <- unlist(lapply(by_churn, function(rows) {
+  sample(rows, floor(0.75 * length(rows)))
+}), use.names = FALSE)
+test_rows <- setdiff(seq_len(nrow(prepared)), train_rows)
+manifest_rows <- c(train_rows, test_rows)
+manifest <- data.frame(
+  CustomerID = prepared$CustomerID[manifest_rows],
+  split = rep(c("train", "test"), c(length(train_rows), length(test_rows))),
+  cv_fold = NA_integer_
+)
+
+set.seed(445)
+train_by_churn <- split(seq_along(train_rows), prepared$Churn[train_rows])
+for (rows in train_by_churn) {
+  manifest$cv_fold[rows] <- sample(rep(1:3, length.out = length(rows)))
+}
+
+stopifnot(!anyDuplicated(manifest$CustomerID),
+          setequal(prepared$CustomerID, manifest$CustomerID),
+          all(manifest$cv_fold[manifest$split == "train"] %in% 1:3),
+          all(is.na(manifest$cv_fold[manifest$split == "test"])))
+split_labels <- factor(manifest$split, levels = c("train", "test"),
+                       labels = c("Training", "Reserved test"))
+knitr::kable(as.data.frame.matrix(table(split_labels, churn_label[manifest_rows])),
+             caption = "Customer counts by partition and observed churn outcome",
+             format.args = list(big.mark = ","))
+knitr::kable(as.data.frame.matrix(table(manifest$cv_fold, churn_label[manifest_rows])),
+             caption = "Customer counts within each training fold",
+             format.args = list(big.mark = ","))
+
+dir.create("Generated_Data", showWarnings = FALSE)
+write.csv(prepared, "Generated_Data/cleaned_data.csv", row.names = FALSE, na = "")
+write.csv(manifest, "Generated_Data/split_manifest.csv", row.names = FALSE, na = "")
+```
+
+The cleaned master retains all source columns for auditing and exploration.
+Use `CustomerID` to join the two files and use the eligibility review in
+`02_EDA.Rmd` before choosing predictors.

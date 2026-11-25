@@ -1,0 +1,11 @@
+# BUS 445 Cell2Cell R Markdown workflow
+# R and Pandoc are system dependencies. Install CRAN packages via install.packages().
+# Versions marked "verified" describe the environment used to run the notebooks.
+R 4.5.1 (verified)
+Pandoc >= 2.8 (verified with 3.4)
+
+# Direct CRAN package dependencies
+rmarkdown 2.32 (verified)
+knitr 1.52 (verified)
+
+# splines, stats, graphics, grDevices, and utils ship with R.

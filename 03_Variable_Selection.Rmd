@@ -1,0 +1,309 @@
+---
+title: "Cell2Cell | Variable selection"
+output:
+  html_document:
+    code_folding: hide
+---
+
+This analysis uses the shared training split from `01_Data_Cleaning.Rmd`
+and the predictor eligibility review in `02_EDA.Rmd`. Logistic regression
+provides an interpretable benchmark for ranking customers when outreach
+capacity is limited. Predictor selection uses the training partition.
+
+```{r load-training}
+cleaned <- read.csv("Generated_Data/cleaned_data.csv", na.strings = c("", "NA"))
+manifest <- read.csv("Generated_Data/split_manifest.csv")
+stopifnot(!anyDuplicated(cleaned$CustomerID), !anyDuplicated(manifest$CustomerID),
+          setequal(cleaned$CustomerID, manifest$CustomerID))
+training_manifest <- subset(manifest, split == "train")
+training <- cleaned[match(training_manifest$CustomerID, cleaned$CustomerID), ]
+```
+
+The model estimates the chance of the recorded churn outcome, where
+`Yes` means the customer left during the observation period. A higher score
+moves an account closer to the top of the outreach list.
+
+## Feature engineering
+
+The code below defines the derived fields used in exploration and modeling.
+It computes missingness flags and guarded ratios before any fold imputation.
+
+```{r feature-setup}
+# Derive row-level features before any imputation. Scoring data may omit Churn.
+add_cell2cell_features <- function(data) {
+  data$billing_gap <- data$MonthlyRevenue - data$TotalRecurringCharge
+  data$UsageChangeMissing <- as.integer(is.na(data$PercChangeMinutes))
+  usable_minutes <- which(data$MonthlyMinutes > 0 & data$DroppedCalls >= 0)
+  data$DroppedCallRate <- rep(NA_real_, nrow(data))
+  data$DroppedCallRate[usable_minutes] <-
+    100 * data$DroppedCalls[usable_minutes] / data$MonthlyMinutes[usable_minutes]
+  data$InactiveSubs <- data$UniqueSubs - data$ActiveSubs
+  data$InactiveSubs[which(data$InactiveSubs < 0)] <- NA
+  if ("Churn" %in% names(data)) {
+    stopifnot(all(data$Churn %in% c("Yes", "No")))
+    data$churn_flag <- as.integer(data$Churn == "Yes")
+  }
+  data
+}
+
+benchmark <- c("MonthsInService", "CurrentEquipmentDays", "PercChangeMinutes",
+               "DroppedCalls", "BlockedCalls", "CustomerCareCalls",
+               "MonthlyRevenue", "PercChangeRevenues")
+additional_blocks <- list(
+  handset = c("HandsetWebCapable", "HandsetRefurbished", "Handsets",
+              "HandsetModels", "HandsetPrice"),
+  roaming = "RoamingCalls",
+  overage = "OverageMinutes",
+  subscriptions = c("UniqueSubs", "ActiveSubs"),
+  account_history = c("NewCellphoneUser", "NotNewCellphoneUser",
+                      "ReferralsMadeBySubscriber"),
+  calling = c("MonthlyMinutes", "DirectorAssistedCalls", "UnansweredCalls",
+              "ThreewayCalls", "ReceivedCalls", "OutboundCalls", "InboundCalls",
+              "PeakCallsInOut", "OffPeakCallsInOut", "CallForwardingCalls",
+              "CallWaitingCalls")
+)
+alternate_fields <- c("TotalRecurringCharge", "DroppedBlockedCalls")
+eligible <- c(benchmark, unlist(additional_blocks, use.names = FALSE), alternate_fields)
+```
+
+## Feature screening and cross-validation
+
+Add each block separately to the same benchmark to measure its incremental
+value. Test web capability on its own as well, so its contribution can be
+read separately from the other handset fields. Also fit a combined model to
+see how the blocks perform together.
+These are screening comparisons. Review fold-to-fold consistency before
+keeping a block. Within each analysis fold, learn numeric medians and spline
+knots. For categorical fields, use observed analysis-fold levels and replace
+missing or unseen values with that fold's most frequent level.
+
+AUC measures how often a churner ranks above a non-churner across the
+full list. Precision measures the share of selected customers who churned.
+Lift compares that share with the rate from random selection in the same
+fold. For example, 10% capacity means reviewing the 100 highest-ranked
+customers per 1,000. We compare the same 10%, 20%, and 30% cutoffs across
+models because the best ranking can depend on how many customers the
+team can contact. A lift of 1.44 means the selected list contained about
+44% more historical churners than a random list of the same size.
+
+The first table averages scores across the three validation folds. Changes
+(`Δ`) are measured against the benchmark on those same folds and cutoffs.
+The model names match the R formulas used in the handoff.
+
+```{r variable-selection}
+benchmark_terms <- c(
+  "splines::ns(MonthsInService, df = 3)", setdiff(benchmark, "MonthsInService"),
+  "billing_gap"
+)
+block_models <- lapply(additional_blocks, function(fields) c(benchmark_terms, fields))
+names(block_models) <- paste0("add_", names(block_models))
+model_terms <- c(
+  list(m1_benchmark = c("MonthsInService", "MonthlyRevenue"),
+       benchmark = benchmark_terms),
+  block_models,
+  list(
+    usage_missing = c(benchmark_terms, "UsageChangeMissing"),
+    dropped_call_rate = c(benchmark_terms, "MonthlyMinutes", "DroppedCallRate"),
+    dropped_rate_reference = c(benchmark_terms, "MonthlyMinutes"),
+    inactive_subs = c(benchmark_terms, "InactiveSubs"),
+    tenure_equipment = c(benchmark_terms,
+                         "splines::ns(MonthsInService, df = 3):CurrentEquipmentDays"),
+    web_capability = c(benchmark_terms, "HandsetWebCapable"),
+    subscriptions_and_web = c(benchmark_terms, additional_blocks$subscriptions,
+                              "HandsetWebCapable"),
+    all_blocks = c(benchmark_terms, unlist(additional_blocks, use.names = FALSE)),
+    recurring_charge = c(setdiff(benchmark_terms, "billing_gap"), "TotalRecurringCharge"),
+    combined_network = c(setdiff(benchmark_terms, c("DroppedCalls", "BlockedCalls")),
+                         "DroppedBlockedCalls")
+  )
+)
+inputs <- c(eligible, "billing_gap", "UsageChangeMissing", "DroppedCallRate", "InactiveSubs")
+
+# Fit preprocessing on the analysis data and apply it to the scoring rows.
+prepare_cell2cell_fold <- function(analysis, assessment, inputs) {
+  for (field in inputs) {
+    values <- analysis[[field]]
+    if (is.numeric(values)) {
+      median_value <- median(values, na.rm = TRUE)
+      analysis[[field]][is.na(values)] <- median_value
+      assessment[[field]][is.na(assessment[[field]])] <- median_value
+    } else {
+      counts <- sort(table(values), decreasing = TRUE)
+      levels_seen <- names(counts)
+      analysis[[field]][is.na(values)] <- levels_seen[1L]
+      unseen <- !assessment[[field]] %in% levels_seen
+      assessment[[field]][unseen] <- levels_seen[1L]
+      analysis[[field]] <- factor(analysis[[field]], levels = levels_seen)
+      assessment[[field]] <- factor(assessment[[field]], levels = levels_seen)
+    }
+  }
+  list(analysis = analysis, assessment = assessment)
+}
+
+training <- add_cell2cell_features(training)
+
+fold <- training_manifest$cv_fold
+stopifnot(!anyNA(fold), setequal(fold, 1:3))
+
+capacities <- c(0.10, 0.20, 0.30)
+validation_results <- lapply(1:3, function(fold_id) {
+  analysis <- training[fold != fold_id, ]
+  assessment <- training[fold == fold_id, ]
+  processed <- prepare_cell2cell_fold(analysis, assessment, inputs)
+  analysis <- processed$analysis
+  assessment <- processed$assessment
+
+  outcome <- assessment$churn_flag
+  positives <- sum(outcome)
+  negatives <- length(outcome) - positives
+
+  do.call(rbind, lapply(names(model_terms), function(candidate) {
+    fit <- glm(reformulate(model_terms[[candidate]], "churn_flag"),
+               family = binomial(), data = analysis, na.action = na.fail)
+    stopifnot(fit$converged, nobs(fit) == nrow(analysis),
+              identical(rownames(model.frame(fit)), rownames(analysis)),
+              all(model.response(model.frame(fit)) == analysis$churn_flag))
+    probability <- predict(fit, newdata = assessment, type = "response")
+    auc <- (sum(rank(probability)[outcome == 1]) - positives * (positives + 1) / 2) /
+      (positives * negatives)
+    ranked <- order(-probability, assessment$CustomerID)
+    precision <- vapply(capacities, function(capacity) {
+      contacted <- head(ranked, floor(capacity * length(ranked)))
+      mean(outcome[contacted])
+    }, numeric(1))
+
+    data.frame(fold = fold_id, model = candidate, capacity = capacities, auc = auc,
+               precision = precision, lift = precision / mean(outcome), bic = BIC(fit))
+  }))
+})
+
+fold_scores <- do.call(rbind, validation_results)
+benchmark_scores <- subset(fold_scores, model == "benchmark",
+                           select = c(fold, capacity, auc, lift))
+names(benchmark_scores)[3:4] <- c("benchmark_auc", "benchmark_lift")
+paired <- merge(fold_scores, benchmark_scores, by = c("fold", "capacity"))
+paired$auc_change <- paired$auc - paired$benchmark_auc
+paired$lift_change <- paired$lift - paired$benchmark_lift
+selection_summary <- aggregate(cbind(auc, precision, lift, auc_change, lift_change) ~
+                                 model + capacity, paired, mean)
+display_scores <- selection_summary
+display_scores$capacity <- paste0(100 * display_scores$capacity, "%")
+display_scores$precision <- sprintf("%.1f%%", 100 * display_scores$precision)
+knitr::kable(display_scores, digits = 3,
+             col.names = c("Model", "Outreach capacity", "AUC", "Precision", "Lift",
+                           "Δ AUC", "Δ lift"),
+             caption = "Average performance on the shared validation folds")
+```
+
+The fold-by-fold results show whether gains at 10% outreach are consistent
+across different groups of customers.
+
+### Fold-by-fold results at 10% outreach
+
+```{r fold-comparison}
+fold_display <- subset(
+  paired,
+  capacity == 0.10,
+  select = c(fold, model, auc_change, lift_change)
+)
+knitr::kable(
+  fold_display,
+  digits = 3,
+  col.names = c("Validation fold", "Model", "Δ AUC", "Δ lift")
+)
+```
+
+## Secondary check using BIC
+
+BIC uses fit and the number of estimated parameters to compare logistic
+candidates. Each comparison uses the same fitting rows and outcome within
+a fold. Lower values favor fit relative to complexity. Average differences
+from the benchmark describe the three folds. Outreach lift and business
+relevance take priority when these comparisons point in different directions.
+
+When all billing values are observed, a linear model that uses monthly
+revenue and the billing gap can represent the same relationship as one
+that uses monthly revenue and the fixed charge. Fold-specific imputation
+can create small differences, so treat this comparison as a choice of
+representation.
+
+```{r bic}
+bic_comparison <- unique(paired[c("fold", "model", "bic")])
+benchmark_bic <- subset(bic_comparison, model == "benchmark")
+bic_comparison$bic_change <- bic_comparison$bic -
+  benchmark_bic$bic[match(bic_comparison$fold, benchmark_bic$fold)]
+knitr::kable(aggregate(bic_change ~ model, bic_comparison, mean), digits = 1,
+             col.names = c("Model", "Mean difference from benchmark BIC"))
+```
+
+### What this means
+
+The focused candidate had the lowest mean BIC among the logistic candidates,
+63.0 points below the benchmark. The broader model was 28.6 points above
+the benchmark despite achieving higher overall AUC.
+
+## Recommended variables for the next model comparison
+
+The M1-style benchmark uses tenure and monthly revenue. Prior retention
+contacts are excluded because their timing relative to scoring is unverified.
+The results at 10%, 20%, and 30% show the effect of changing M1's proposed
+outreach cutoff while holding the model and validation assignments fixed.
+
+The focused logistic candidate adds web capability and the two subscription
+counts (`UniqueSubs` and `ActiveSubs`) to the benchmark. Its other terms
+are nonlinear tenure, equipment age, change in minutes, dropped and blocked
+calls, customer care calls, monthly revenue, change in revenue, and the
+billing gap. These fields describe the relationship
+with the account, potential service friction, and revenue exposure.
+
+The table below gives the exact focused and broader specifications. The model code above exposes these formulas as `model_terms$subscriptions_and_web`
+and `model_terms$all_blocks`.
+
+```{r handoff}
+knitr::kable(data.frame(
+  candidate = c("Focused", "Broader challenger"),
+  predictors = vapply(model_terms[c("subscriptions_and_web", "all_blocks")],
+                      paste, collapse = ", ", FUN.VALUE = character(1)),
+  row.names = NULL
+))
+```
+
+Feature tests add one candidate at a time to the shared benchmark. Compare
+`dropped_call_rate` with `dropped_rate_reference` to isolate the addition
+of the rate beyond raw drops and monthly minutes. Its units are provisional
+until the dropped-call observation window is confirmed. The interaction
+lets the association of tenure with churn vary with equipment age.
+
+### What this means
+
+At 10% outreach capacity, the focused candidate had **0.612 AUC,
+41.4% precision, and 1.435 lift**, compared with 0.605 AUC and 1.364 lift
+for the benchmark. The broader challenger had the best AUC (0.617) and
+outperformed the focused candidate on lift at 20% and 30%.
+
+The missingness flag, subscription gap, and tenure interaction improved
+10% lift when tested separately against the benchmark. Their contribution
+beyond the focused candidate is still open. The provisional dropped-call rate
+raised lift from 1.373 to 1.400 versus its minutes-adjusted reference.
+Use of the call rate depends on confirming that the source fields cover
+comparable periods.
+
+## Limitations
+
+- **Timing and seasonality.** The supplied data are a cross-sectional snapshot
+  with an unverified churn horizon. Quarter-over-quarter changes lack calendar
+  labels, so this analysis cannot test a 30-day forecast or holiday patterns
+  such as Black Friday. Predictor availability at the scoring date still
+  requires verification.
+- **Missing data.** Fold-specific median and mode imputation keeps incomplete
+  records usable. It can mask differences between customers with and without
+  recorded values. For example, missing usage and revenue changes occur together
+  and are more common among longer-tenured customers in this file.
+- **Model selection and generalization.** The same three training folds were
+  used to compare several predictor sets. Small gains may vary across samples
+  or outreach cutoffs. Once the specifications are locked, evaluate them on
+  the reserved test partition. Earlier full-file exploration limits its
+  independence, so future performance should also be checked on a later cohort.
+- **Business impact.** AUC and lift measure how well models rank observed
+  churners. A randomized outreach pilot is needed to estimate incremental
+  retention and net contribution after contact and offer costs.

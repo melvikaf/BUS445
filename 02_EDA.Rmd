@@ -1,0 +1,398 @@
+---
+title: "Cell2Cell | Exploratory data analysis"
+output:
+  html_document:
+    code_folding: hide
+---
+
+This analysis uses the training customers from the shared split to examine
+which account characteristics may help prioritize retention outreach. In
+the source, churn
+`Yes` means the customer left during the recorded observation period.
+`No` means they did not leave during that period.
+
+```{r load-training}
+cleaned <- read.csv("Generated_Data/cleaned_data.csv", na.strings = c("", "NA"))
+manifest <- read.csv("Generated_Data/split_manifest.csv")
+stopifnot(!anyDuplicated(cleaned$CustomerID), !anyDuplicated(manifest$CustomerID),
+          setequal(cleaned$CustomerID, manifest$CustomerID))
+training_manifest <- subset(manifest, split == "train")
+training <- cleaned[match(training_manifest$CustomerID, cleaned$CustomerID), ]
+churned <- training$Churn == "Yes"
+baseline <- mean(churned)
+knitr::kable(
+  data.frame(Outcome = c("Did not churn (No)", "Churned (Yes)"),
+             Customers = c(sum(!churned), sum(churned))),
+  format.args = list(big.mark = ","),
+  caption = "Observed churn outcomes among training customers"
+)
+
+churn_summary <- function(group) {
+  group <- addNA(as.factor(group), ifany = TRUE)
+  counts <- table(group, churned)
+  n <- rowSums(counts)
+  keep <- n > 0
+  rate <- counts[keep, "TRUE"] / n[keep]
+  data.frame(
+    group = ifelse(is.na(rownames(counts)[keep]), "Missing", rownames(counts)[keep]),
+    customers = unname(n[keep]),
+    churned = unname(counts[keep, "TRUE"]),
+    churn_pct = round(100 * unname(rate), 1),
+    difference_pp = round(100 * (unname(rate) - baseline), 1)
+  )
+}
+
+tenure <- cut(training$MonthsInService, c(-Inf, 6, 12, 24, 36, Inf))
+equipment <- cut(training$CurrentEquipmentDays, c(0, 181, 366, 731, Inf),
+                 right = FALSE,
+                 labels = c("0–180", "181–365", "366–730", "731+"))
+revenue <- cut(training$MonthlyRevenue, c(-Inf, 0, 31, 61, 101, Inf),
+               right = FALSE,
+               labels = c("Negative", "Under $31", "$31 to <$61",
+                          "$61 to <$101", "$101+"))
+```
+
+The training churn rate is **`r round(100 * baseline, 1)`%**. In the
+tables below, `difference_pp` is the difference from that rate in percentage
+points. Rates from smaller groups are less stable, so the tables include
+customer counts. The dashed line in the charts marks the training rate.
+
+For example, a group with 31.0% churn is 2.2 percentage points above the
+28.8% training rate.
+
+## Milestone 1 assumptions and new hypotheses
+
+Churn may vary nonlinearly with tenure, rise with equipment age, or differ
+across revenue bands. Prior retention contact may also be associated with churn
+because customers who contact the team can already be at higher risk.
+
+The Milestone 1 canvas described about 71,000 records and proposed a 30-day
+forecast. The supplied file contains 51,047 records and the outcome horizon
+remains unverified. This notebook checks tenure, revenue, and historical
+retention associations. M1 proposed targeting the top decile and evaluating
+the top 30%. `03_Variable_Selection.Rmd` compares the M1-style benchmark
+at those cutoffs and at 20%. The observed churn share describes this sample.
+The file leaves population monthly churn, contact cost, incremental retention,
+and campaign profitability unresolved.
+
+```{r core-comparisons, results="asis", fig.width=9, fig.height=4}
+tenure_summary <- churn_summary(tenure)
+core_groups <- list(
+  "Time with the carrier (months)" = tenure,
+  "Time with the current handset (days)" = equipment,
+  "Average monthly bill (USD)" = revenue,
+  "Past calls to the retention team" =
+    ifelse(training$RetentionCalls > 0, "Called", "Did not call"),
+  "Past acceptance of a retention offer" =
+    ifelse(training$RetentionOffersAccepted > 0, "Accepted an offer", "None accepted")
+)
+for (label in names(core_groups)) {
+  cat("\n\n")
+  print(knitr::kable(
+    churn_summary(core_groups[[label]]),
+    caption = label,
+    col.names = c("Group", "Customers", "Churned", "Churn (%)",
+                  "Vs. training rate (pp)")
+  ))
+}
+
+barplot(tenure_summary$churn_pct, names.arg = tenure_summary$group,
+        main = "Observed churn is highest at more than 12 to 24 months of service",
+        xlab = "Months in service", ylab = "Observed churn (%)",
+        col = "#31688E")
+abline(h = 100 * baseline, lty = 2)
+hist(training$MonthlyRevenue, breaks = 50, col = "#31688E",
+     main = "Distribution of monthly revenue", xlab = "Monthly revenue (USD)")
+```
+
+### What this means
+
+The group with more than 12 and up to 24 months of service had **31.0%**
+observed churn, compared with **18.6%** among customers with up to six
+months. The pattern supports testing a nonlinear tenure term. Prior retention contact
+may flag customers who were already at higher risk, so these comparisons
+cannot measure whether offers worked.
+
+### Additional churn comparisons, including tenure by equipment age
+
+```{r additional-comparisons, results="asis"}
+change_band <- function(x) {
+  factor(sign(x), levels = c(-1, 0, 1), labels = c("Decrease", "No change", "Increase"))
+}
+
+groups <- with(training, list(
+  handset_models = cut(HandsetModels, c(-Inf, 1, 2, Inf)),
+  web_capable = HandsetWebCapable,
+  usage_change = change_band(PercChangeMinutes),
+  revenue_change = change_band(PercChangeRevenues),
+  dropped_calls = DroppedCalls > 0,
+  blocked_calls = BlockedCalls > 0,
+  customer_care_calls = CustomerCareCalls > 0,
+  overage = OverageMinutes > 0,
+  revenue_above_recurring_charge = MonthlyRevenue > TotalRecurringCharge,
+  multiple_active_lines = ActiveSubs > 1,
+  tenure_by_equipment = interaction(tenure, equipment, drop = TRUE, sep = " / ")
+))
+for (label in names(groups)) {
+  values <- groups[[label]]
+  if (is.logical(values)) {
+    values <- ifelse(values, "Yes", "No")
+  }
+  cat("\n\n")
+  print(knitr::kable(
+    churn_summary(values),
+    caption = tools::toTitleCase(gsub("_", " ", label)),
+    col.names = c("Group", "Customers", "Churned", "Churn (%)",
+                  "Vs. training rate (pp)")
+  ))
+}
+```
+
+## Device, roaming, and subscription relationships
+
+Web capability can reflect device constraints, roaming may signal a mismatch
+with the plan, and active-line counts may reflect how closely the customer
+is tied to the account. Compare churn rates before using these fields to
+rank customers. In the charts, “Yes” refers to the question in each title.
+For example, “Yes” under “Any roaming calls” means the account had recorded
+roaming activity.
+
+```{r hypothesis-plots, fig.width=10, fig.height=4}
+plot_groups <- list(
+  "Handset web capability" = training$HandsetWebCapable,
+  "Any roaming calls" = ifelse(training$RoamingCalls > 0, "Yes", "No"),
+  "More than one active line" = ifelse(training$ActiveSubs > 1, "Yes", "No")
+)
+old_par <- par(mfrow = c(1, 3))
+for (label in names(plot_groups)) {
+  summary <- churn_summary(plot_groups[[label]])
+  barplot(summary$churn_pct, names.arg = summary$group, main = label,
+          ylim = c(0, 50), ylab = "Observed churn (%)", col = "#31688E")
+  abline(h = 100 * baseline, lty = 2)
+}
+par(old_par)
+```
+
+## Predictor eligibility and exploration
+
+Fields were screened for their relevance to an account review and whether
+they could plausibly be available before outreach. The model comparisons
+assume standard account and usage fields are available at scoring time.
+Production use still requires verification of their measurement dates.
+
+| Candidate block | Business rationale |
+|---|---|
+| Tenure, equipment age, service friction, and billing | Use the existing benchmark to represent lifecycle, service experience, and account value. |
+| Handsets | Web capability, refurbishment, price, and device counts can reflect device constraints and upgrade history. |
+| Roaming and overage | Usage outside a typical plan may affect the customer's bill or indicate an unmet plan need. |
+| Subscription and account history | Current and historical lines, recent-user indicators, and referrals describe the account relationship. |
+| Calling activity | Call volume, direction, time of use, and call features describe how customers use the service. |
+| Alternate representations | Compare recurring charge in place of billing gap, and combined dropped/blocked calls in place of separate counts. |
+
+The response and customer ID have dedicated roles. Prior retention contacts
+and offers require verified timing. Geography, household and credit data, and
+marketing or purchasing profiles are deferred pending a documented rationale
+and eligibility review.
+
+EDA and variable selection use the same predictor definitions in
+`03_Variable_Selection.Rmd`.
+
+```{r load-feature-definitions, include=FALSE}
+selection_notebook <- readLines("03_Variable_Selection.Rmd", warn = FALSE)
+feature_start <- match("```{r feature-setup}", selection_notebook)
+stopifnot(!is.na(feature_start))
+feature_end <- which(seq_along(selection_notebook) > feature_start &
+                     selection_notebook == "```")[1L]
+stopifnot(!is.na(feature_end))
+knitr::read_chunk(lines = selection_notebook, labels = "feature-setup",
+                  from = feature_start + 1L, to = feature_end - 1L)
+```
+
+```{r feature-setup, echo=FALSE}
+```
+
+```{r eligibility}
+field_groups <- c(
+  list(outcome_or_key = c("Churn", "CustomerID"), benchmark = benchmark),
+  additional_blocks,
+  list(
+    alternate_representation = alternate_fields,
+    timing_review = c("RetentionCalls", "RetentionOffersAccepted",
+                      "MadeCallToRetentionTeam"),
+    geography_review = "ServiceArea",
+    policy_review = c(
+      "AgeHH1", "AgeHH2", "ChildrenInHH", "TruckOwner", "RVOwner",
+      "Homeownership", "BuysViaMailOrder", "RespondsToMailOffers",
+      "OptOutMailings", "NonUSTravel", "OwnsComputer", "HasCreditCard",
+      "IncomeGroup", "OwnsMotorcycle", "AdjustmentsToCreditRating",
+      "CreditRating", "PrizmCode", "Occupation", "MaritalStatus"
+    )
+  )
+)
+assigned_fields <- unlist(field_groups, use.names = FALSE)
+stopifnot(!anyDuplicated(assigned_fields), setequal(names(cleaned), assigned_fields))
+field_review <- stack(field_groups)
+names(field_review) <- c("field", "group")
+field_review$missing <- unname(colSums(is.na(training[field_review$field])))
+field_review$distinct_observed <- vapply(training[field_review$field], function(x) {
+  length(unique(x[!is.na(x)]))
+}, integer(1))
+knitr::kable(field_review)
+```
+
+For eligible numeric variables, the profiles below use up to four bands based
+on distinct training quantiles. Repeated cut points are combined so
+zero-heavy fields can have fewer bands. The roaming profile explicitly
+compares zero and positive use. Categorical fields use recorded levels.
+These bands summarize churn and group sizes. The models use the original
+numeric values.
+
+### Churn profiles for individual eligible predictors
+
+```{r eligible-profiles, results="asis"}
+eligible <- c(benchmark, unlist(additional_blocks, use.names = FALSE), alternate_fields)
+for (field in eligible) {
+  values <- training[[field]]
+  group <- values
+  if (is.numeric(values) && length(unique(na.omit(values))) > 8L) {
+    breaks <- unique(quantile(values, seq(0, 1, by = 0.25), na.rm = TRUE))
+    group <- cut(values, breaks, include.lowest = TRUE, dig.lab = 6)
+  }
+  if (field == "RoamingCalls") {
+    group <- ifelse(values == 0, "Zero", ifelse(values > 0, "Positive", "Negative"))
+  }
+  cat("\n\n")
+  print(knitr::kable(
+    churn_summary(group),
+    caption = field,
+    col.names = c("Group", "Customers", "Churned", "Churn (%)",
+                  "Vs. training rate (pp)")
+  ))
+}
+```
+
+## Numeric correlations and redundancy
+
+Spearman correlation compares monotonic relationships using ranks, which
+limits the influence of extreme signed billing values. Use pairwise complete
+training observations and report the sample size for each displayed pair.
+A correlation near 1 or -1 means two fields tend to move together or in
+opposite directions. We flag absolute correlations of 0.70 or more to spot
+possible overlap. For example, a combined network-friction count can repeat
+information in the separate dropped and blocked call counts. The next
+notebook tests whether a different representation improves ranking.
+
+```{r correlations, fig.width=10, fig.height=9}
+numeric_fields <- eligible[vapply(training[eligible], is.numeric, logical(1))]
+numeric_data <- training[numeric_fields]
+rho <- cor(numeric_data, method = "spearman", use = "pairwise.complete.obs")
+pair_rows <- which(upper.tri(rho) & abs(rho) >= 0.70, arr.ind = TRUE)
+observed_pairs <- crossprod(!is.na(as.matrix(numeric_data)) * 1)
+pairs <- data.frame(first = rownames(rho)[pair_rows[, 1]],
+                    second = colnames(rho)[pair_rows[, 2]],
+                    spearman = rho[pair_rows], customers = observed_pairs[pair_rows])
+knitr::kable(pairs[order(abs(pairs$spearman), decreasing = TRUE), ], digits = 3)
+
+heatmap(rho, Rowv = NA, Colv = NA, scale = "none", margins = c(12, 12),
+        col = hcl.colors(21, "Blue-Red 3"), breaks = seq(-1, 1, length.out = 22),
+        main = "Rank correlations among eligible numeric predictors")
+```
+
+The tenure comparison motivates a flexible tenure term. Subscription and
+handset counts can encode overlapping account history. Compare candidate
+blocks on shared folds before recommending any variable set. Churn groups
+describe historical associations, including for past retention contacts.
+
+## Missingness and service-feature checks
+
+Do unavailable quarter changes identify a distinct account segment? Compare
+the missingness flags on training records and show how missingness varies by
+tenure. Differences in churn can motivate a missingness indicator. Verify
+that the flag is observable before scoring and that the data collection
+process stays consistent.
+
+```{r engineered-eda}
+training <- add_cell2cell_features(training)
+change_status <- function(x) ifelse(is.na(x), "Missing", "Recorded")
+knitr::kable(as.data.frame.matrix(with(training, table(
+  `Usage change` = change_status(PercChangeMinutes),
+  `Revenue change` = change_status(PercChangeRevenues)
+))), caption = "Customer counts by usage-change status (rows) and revenue-change status (columns)")
+knitr::kable(churn_summary(change_status(training$PercChangeMinutes)),
+             caption = "Churn by whether usage change was recorded")
+knitr::kable(aggregate(cbind(customers = rep(1, nrow(training)),
+                             changes_missing = training$UsageChangeMissing),
+                       by = list(tenure = tenure), FUN = sum))
+knitr::kable(churn_summary(cut(training$InactiveSubs, c(-Inf, 0, 1, Inf))))
+knitr::kable(churn_summary(cut(training$DroppedCallRate, c(-Inf, 0, 1, 5, Inf))))
+```
+
+The dictionary defines monthly minutes and dropped-call counts but gives no
+explicit observation window for dropped calls. Treat drops per 100 minutes
+as provisional. A missing or nonpositive denominator yields an unavailable
+rate. Unique minus active lines describes the count difference and cannot
+identify which lines disconnected or when.
+
+### What this means
+
+Both quarter changes are missing for the same 277 training customers.
+Their observed churn rate was 56.7%, compared with 28.6% for the 38,008
+customers with both changes recorded. This supports testing the missingness
+flag. It does not establish why the fields are missing.
+
+## Revenue exposure
+
+How much recorded monthly revenue is associated with historical churners?
+Compare observed revenue by churn label and by tenure, equipment age, and
+revenue tier. Report coverage so that missing revenue remains visible.
+
+```{r revenue-exposure, results='asis'}
+segment_groups <- list("Churn status" = ifelse(churned, "Churned", "Did not churn"),
+                       "Tenure" = tenure, "Equipment age" = equipment,
+                       "Recorded revenue tier" = revenue)
+for (label in names(segment_groups)) {
+  group <- addNA(as.factor(segment_groups[[label]]), ifany = TRUE)
+  segments <- split(seq_len(nrow(training)), group, drop = TRUE)
+  exposure <- do.call(rbind, lapply(segments, function(rows) {
+    value <- training$MonthlyRevenue[rows]
+    observed_churn <- churned[rows]
+    data.frame(
+      customers = length(rows),
+      revenue_observed = sum(!is.na(value)),
+      median_revenue_usd = if (all(is.na(value))) NA_real_ else median(value, na.rm = TRUE),
+      churners = sum(observed_churn),
+      churners_with_revenue = sum(observed_churn & !is.na(value)),
+      churner_revenue_usd = if (any(observed_churn & !is.na(value))) {
+        sum(value[observed_churn], na.rm = TRUE)
+      } else NA_real_
+    )
+  }))
+  cat("\n\n**", label, "**\n\n", sep = "")
+  print(knitr::kable(exposure, digits = 2))
+}
+```
+
+### What this means
+
+In training, 10,980 of 11,033 historical churners had recorded monthly
+revenue, totaling about **$633,652**. Median monthly revenue was $47.24
+among churners and $48.69 among customers who stayed. These medians suggest
+using revenue to measure customer value alongside a churn score.
+
+```{r billing-gap-summary}
+knitr::kable(as.data.frame(table(
+  sign = factor(sign(training$billing_gap), levels = c(-1, 0, 1),
+                labels = c("Revenue below fixed charge", "Equal",
+                           "Revenue above fixed charge")),
+  useNA = "ifany"
+)), col.names = c("Revenue versus plan charge", "Training customers"))
+```
+
+`TotalRecurringCharge` is the fixed plan charge. `billing_gap` measures
+monthly revenue minus that charge and may include multiple billing components.
+The sum above is historical monthly revenue exposure among observed churners.
+For the financial handoff, a modeled churn probability of 0.40 paired with
+$100 monthly revenue gives $40 of probability-weighted monthly revenue
+exposure for the modeled event. Incremental retained contribution requires
+treatment effectiveness, margin, retained duration, and outreach and offer
+costs.
