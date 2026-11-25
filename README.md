@@ -36,7 +36,7 @@ Rscript -e 'rmarkdown::render("03_Variable_Selection.Rmd")'
 | --- | --- |
 | [01_Data_Cleaning.Rmd](01_Data_Cleaning.Rmd) | Audits data types, missing values, and invalid entries. Writes the cleaned dataset and split manifest. |
 | [02_EDA.Rmd](02_EDA.Rmd) | Revisits Milestone 1 assumptions, explores eligible predictors and churn relationships, and checks correlations using training records. |
-| [03_Variable_Selection.Rmd](03_Variable_Selection.Rmd) | Compares logistic predictor sets on shared training folds using AUC, precision, and lift at 10%, 20%, and 30% outreach capacity. |
+| [03_Variable_Selection.Rmd](03_Variable_Selection.Rmd) | Screens predictor sets and tests focused refinements and handset-price removal on the shared folds. Provides exact logistic formulas and raw forest lists. |
 
 For macOS RStudio installations with the bundled Pandoc layout, the following
 setting makes Pandoc available to terminal renders:
@@ -59,16 +59,114 @@ final evaluation once variable and model choices are locked.
 
 ## Modeling handoff
 
-[03_Variable_Selection.Rmd](03_Variable_Selection.Rmd) contains the feature
-definitions, fold preprocessing, and exact focused and broader model formulas.
-After joining the cleaned data and split assignments, use
-`add_cell2cell_features()` from its Feature engineering section before
-imputing predictors. Use `prepare_cell2cell_fold()` on the fitting and
-validation rows for each training fold. The focused and broader formulas
-are `model_terms$subscriptions_and_web` and `model_terms$all_blocks`.
-The EDA notebook reads the same feature definitions.
+The exact formulas and raw lists are printed in
+[03_Variable_Selection.Rmd](03_Variable_Selection.Rmd) and available from the
+shared R script. From the repository root:
 
-Keep observed `MonthlyRevenue` and `CustomerID` for the financial handoff.
-The revenue exposure in the EDA describes historical churners. Future
-campaign impact requires model scores, treatment-effect evidence,
-contribution margin, retention duration, and outreach and offer costs.
+```r
+source("R/preprocessing.R")
+specs <- cell2cell_handoff_predictors()
+
+reformulate(specs$logistic$focused_both, response = "churn_flag")
+reformulate(specs$logistic$focused_missing, response = "churn_flag")
+reformulate(specs$logistic$broader_without_price, response = "churn_flag")
+specs$forest$focused_raw
+specs$forest$broader_raw
+```
+
+- **Logistic regression.** The primary specification adds
+  `UsageChangeMissing` and the spline-tenure × equipment-age interaction
+  to the original focused terms. It retains both interaction main effects
+  and the original subscription counts. The missingness-only version is the
+  simpler challenger. The broader challenger omits `HandsetPrice`.
+- **Random forest.** The focused and broader raw lists both use numeric
+  tenure, numeric equipment age, and fixed charge. A forest can learn
+  nonlinear splits and interactions. The team can separately test the
+  pre-imputation usage-missingness flag and substitution of billing gap for
+  fixed charge. Logistic screening is evidence for which variants to test.
+- **Both families.** Use `add_cell2cell_features()` before imputation.
+  Within each saved fold, pass fitting rows, assessment rows, and that
+  model's predictor fields to `prepare_cell2cell_fold()`. For a logistic
+  formula, the predictor fields are obtained with
+  `all.vars(reformulate(specs$logistic$focused_both))` (without a response
+  argument). Missing numeric values receive fitting-fold medians. Missing
+  or unseen categories receive the fitting-fold mode and use the same
+  factor levels in both partitions. Keep `CustomerID`, `Churn` and
+  `churn_flag` outside predictor lists. The retention-history fields remain
+  outside both sets until their timing is verified. For a forest classifier, encode
+  `Churn` as a factor with levels `No` and `Yes`, and rank by the
+  predicted probability of `Yes`.
+- **Evaluation.** Compare AUC, precision and lift on the same assessed
+  customers at 10%, 20%, and 30% outreach. Break ties by `CustomerID`.
+  BIC is a secondary fit-versus-complexity check for logistic models fitted
+  on identical rows and outcomes. Use the reserved test set after the
+  team freezes the specification and scoring procedure.
+
+### Preparing one shared validation fold
+
+This example prepares the primary logistic candidate and the focused raw
+forest option for fold 1. Each option uses the same customer assignments.
+
+```r
+source("R/preprocessing.R")
+specs <- cell2cell_handoff_predictors()
+cleaned <- read.csv("Generated_Data/cleaned_data.csv", na.strings = c("", "NA"))
+manifest <- read.csv("Generated_Data/split_manifest.csv")
+training_manifest <- subset(manifest, split == "train")
+training <- cleaned[match(training_manifest$CustomerID, cleaned$CustomerID), ]
+stopifnot(identical(training$CustomerID, training_manifest$CustomerID))
+training <- add_cell2cell_features(training)
+
+validation <- training_manifest$cv_fold == 1
+analysis_rows <- training[!validation, ]
+assessment_rows <- training[validation, ]
+logistic_fields <- all.vars(reformulate(specs$logistic$focused_both))
+logistic_fold <- prepare_cell2cell_fold(analysis_rows, assessment_rows, logistic_fields)
+
+forest_fields <- specs$forest$focused_raw
+forest_fold <- prepare_cell2cell_fold(analysis_rows, assessment_rows, forest_fields)
+forest_x <- forest_fold$analysis[forest_fields]
+forest_y <- factor(forest_fold$analysis$Churn, levels = c("No", "Yes"))
+forest_validation_x <- forest_fold$assessment[forest_fields]
+assessment_ids <- forest_fold$assessment$CustomerID
+```
+
+Preserve the observed `MonthlyRevenue` column keyed by `CustomerID`
+separately from any imputed model copy. The finance teammate can join the
+observed values to later model scores and report revenue coverage.
+
+## Memo-ready findings
+
+Observed training churn peaked at 31.0% at 13–24 months of service, versus
+18.6% in the first six months. Among customers with more than 36 months of
+service, churn ranged from 15.2% with 0–180-day equipment to 39.0% with
+equipment aged 731 days or more. The same 277 training customers lacked
+both usage and revenue changes and had 56.7% observed churn, compared with
+28.6% among customers with both recorded. These are historical
+associations. Scoring-time availability of missingness still requires
+verification.
+
+Adding missingness and the tenure-by-equipment interaction to the focused
+logistic reference raised validation AUC from 0.612 to 0.617 and 10%
+precision from 41.4% to 43.1%. Lift increased from 1.435 to 1.495 at 10%,
+1.327 to 1.375 at 20%, and 1.272 to 1.311 at 30%, with gains in all three
+folds at each cutoff. The price-free broad challenger had AUC 0.617 and
+lift of 1.420, 1.347, and 1.300 across those cutoffs. The original
+subscription counts remain in the primary specification. The algebraically
+equivalent alternative reproduced the same scores, and gap alone performed
+inconsistently across folds.
+
+The training sample contained approximately **$633,652 in recorded monthly
+revenue associated with historical churners**, covering 10,980 of 11,033
+churners (99.52%). Campaign impact requires treatment-effect evidence,
+contribution margin, retained duration, and outreach and offer costs.
+The observation window for churn remains unverified. Earlier full-file
+exploration limits the independence of the reserved test set. The team
+still needs to compare algorithms, agree on outreach capacity, verify
+scoring-time inputs, and evaluate the locked model.
+
+## AI assistance record
+
+| Tool | Use | Verification |
+| --- | --- | --- |
+| Codex | Refined the R Markdown, packaged shared preprocessing, and implemented and documented the predictor-set comparisons. | Rendered the notebooks in fresh R sessions and checked preserved split assignments, preprocessing parity, and validation results. Team review is still required before submission. |

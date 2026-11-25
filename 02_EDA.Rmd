@@ -22,7 +22,9 @@ churned <- training$Churn == "Yes"
 baseline <- mean(churned)
 knitr::kable(
   data.frame(Outcome = c("Did not churn (No)", "Churned (Yes)"),
-             Customers = c(sum(!churned), sum(churned))),
+             Customers = c(sum(!churned), sum(churned)),
+             `Share of training sample` = sprintf("%.1f%%", 100 * c(1 - baseline, baseline)),
+             check.names = FALSE),
   format.args = list(big.mark = ","),
   caption = "Observed churn outcomes among training customers"
 )
@@ -36,10 +38,93 @@ churn_summary <- function(group) {
   data.frame(
     group = ifelse(is.na(rownames(counts)[keep]), "Missing", rownames(counts)[keep]),
     customers = unname(n[keep]),
+    training_share = sprintf("%.1f%%", 100 * unname(n[keep]) / length(churned)),
     churned = unname(counts[keep, "TRUE"]),
     churn_pct = round(100 * unname(rate), 1),
     difference_pp = round(100 * (unname(rate) - baseline), 1)
   )
+}
+
+chart_colors <- c(blue = "#2B6387", light_blue = "#DCE8F0", high = "#A84C35",
+                  baseline = "#BA4116", grid = "#E5EBF0", ink = "#243247")
+
+add_churn_baseline <- function(horizontal_bars = FALSE) {
+  baseline_pct <- 100 * baseline
+  baseline_color <- chart_colors[["baseline"]]
+  if (horizontal_bars) {
+    abline(v = baseline_pct, col = baseline_color, lty = 2, lwd = 2)
+  } else {
+    abline(h = baseline_pct, col = baseline_color, lty = 2, lwd = 2)
+  }
+  mtext(
+    sprintf("Training baseline: %.1f%%", baseline_pct),
+    side = 3, line = 0.25, adj = 1, col = baseline_color, cex = 0.76
+  )
+}
+
+label_churn_bars <- function(positions, rates) {
+  text(
+    positions, rates / 2, labels = sprintf("%.1f%%", rates),
+    col = "white", font = 2, cex = 0.9
+  )
+}
+
+churn_group_labels <- function(summary) {
+  paste0(
+    summary$group, "\n(n = ",
+    format(summary$customers, big.mark = ",", trim = TRUE),
+    "; ", summary$training_share, ")"
+  )
+}
+
+plot_churn_comparison <- function(summary, title) {
+  rows <- rev(seq_len(nrow(summary)))
+  rates <- summary$churn_pct[rows]
+  groups <- churn_group_labels(summary[rows, ])
+  bar_colors <- ifelse(rates > 100 * baseline, chart_colors[["high"]],
+                       chart_colors[["blue"]])
+  maximum <- max(50, ceiling(max(rates) / 10) * 10)
+  old_par <- par(mar = c(4.1, 9.5, 4.4, 1.2))
+  on.exit(par(old_par))
+  positions <- barplot(
+    rates, names.arg = groups, horiz = TRUE, las = 1,
+    xlim = c(0, maximum), xaxt = "n", col = bar_colors, border = NA,
+    main = title, xlab = "Observed churn", cex.names = 0.85
+  )
+  ticks <- seq(0, maximum, 10)
+  axis(1, at = ticks, labels = paste0(ticks, "%"), col = chart_colors[["grid"]])
+  add_churn_baseline(horizontal_bars = TRUE)
+  text(rates / 2, positions, labels = sprintf("%.1f%%", rates),
+       col = "white", font = 2, cex = 0.9)
+}
+
+plot_churn_composition <- function(summary, title, show_baseline = TRUE) {
+  churn_share <- 100 * summary$churned / summary$customers
+  positions <- barplot(
+    rbind("Churned" = churn_share, "Did not churn" = 100 - churn_share),
+    names.arg = churn_group_labels(summary),
+    ylim = c(0, 115),
+    yaxt = "n",
+    main = title,
+    ylab = "Share of customers",
+    col = chart_colors[c("blue", "light_blue")],
+    border = NA,
+    legend.text = TRUE,
+    args.legend = list(x = "top", horiz = TRUE, bty = "n"),
+    cex.names = 0.82
+  )
+  ticks <- seq(0, 100, 25)
+  axis(2, at = ticks, labels = paste0(ticks, "%"), las = 1,
+       col = chart_colors[["grid"]])
+  label_churn_bars(positions, churn_share)
+  text(
+    positions, churn_share + (100 - churn_share) / 2,
+    labels = sprintf("%.1f%%", 100 - churn_share),
+    col = "#243247", font = 2, cex = 0.9
+  )
+  if (show_baseline) {
+    add_churn_baseline()
+  }
 }
 
 tenure <- cut(training$MonthsInService, c(-Inf, 6, 12, 24, 36, Inf))
@@ -52,13 +137,15 @@ revenue <- cut(training$MonthlyRevenue, c(-Inf, 0, 31, 61, 101, Inf),
                           "$61 to <$101", "$101+"))
 ```
 
-The training churn rate is **`r round(100 * baseline, 1)`%**. In the
-tables below, `difference_pp` is the difference from that rate in percentage
-points. Rates from smaller groups are less stable, so the tables include
-customer counts. The dashed line in the charts marks the training rate.
-
-For example, a group with 31.0% churn is 2.2 percentage points above the
-28.8% training rate.
+The training churn rate is **`r round(100 * baseline, 1)`%**. A
+**percentage point** is the difference between two percentages. For example,
+a group with 31.0% churn is **2.2 percentage points above** the 28.8% training
+rate (31.0 − 28.8). A negative difference means the group's churn rate is
+below the training rate. Smaller groups can have less stable rates, so the
+tables show customer counts and each group's percentage of the full training
+sample. In the charts, percentages beside `n` are group shares. Percentages
+inside the bars describe outcomes within each group. The dashed orange line
+marks the training churn rate.
 
 ## Milestone 1 assumptions and new hypotheses
 
@@ -91,27 +178,119 @@ for (label in names(core_groups)) {
   print(knitr::kable(
     churn_summary(core_groups[[label]]),
     caption = label,
-    col.names = c("Group", "Customers", "Churned", "Churn (%)",
-                  "Vs. training rate (pp)")
+    col.names = c("Group", "Customers", "Share of training sample", "Churned", "Churn (%)",
+                  "Difference from training rate (percentage points)")
   ))
 }
 
-barplot(tenure_summary$churn_pct, names.arg = tenure_summary$group,
-        main = "Observed churn is highest at more than 12 to 24 months of service",
-        xlab = "Months in service", ylab = "Observed churn (%)",
-        col = "#31688E")
-abline(h = 100 * baseline, lty = 2)
-hist(training$MonthlyRevenue, breaks = 50, col = "#31688E",
-     main = "Distribution of monthly revenue", xlab = "Monthly revenue (USD)")
+tenure_plot <- tenure_summary
+tenure_plot$group <- c("Up to 6", "7–12", "13–24", "25–36", "Over 36")
+tenure_positions <- seq_len(nrow(tenure_plot))
+plot(
+  tenure_positions, tenure_plot$churn_pct,
+  type = "n", xaxt = "n", yaxt = "n", bty = "l", ylim = c(0, 40),
+  xlim = range(tenure_positions) + c(-0.35, 0.35),
+  main = "Observed churn peaks at 13–24 months of service",
+  xlab = "", ylab = "Observed churn"
+)
+tenure_ticks <- seq(0, 40, 10)
+abline(h = tenure_ticks, col = chart_colors[["grid"]])
+axis(2, at = tenure_ticks, labels = paste0(tenure_ticks, "%"), las = 1,
+     col = chart_colors[["grid"]])
+axis(1, at = tenure_positions, labels = FALSE, col = chart_colors[["grid"]])
+text(
+  tenure_positions, par("usr")[3], labels = churn_group_labels(tenure_plot),
+  pos = 1, offset = 0.9, xpd = TRUE, cex = 0.8
+)
+mtext("Months in service", side = 1, line = 3.6)
+add_churn_baseline()
+lines(tenure_positions, tenure_plot$churn_pct, col = chart_colors[["blue"]], lwd = 2)
+points(tenure_positions, tenure_plot$churn_pct, col = chart_colors[["blue"]], pch = 19)
+text(
+  tenure_positions, tenure_plot$churn_pct,
+  labels = sprintf("%.1f%%", tenure_plot$churn_pct),
+  pos = 3, offset = 0.7, col = "#234D6A", font = 2
+)
 ```
 
-### What this means
+### What the tenure chart shows
 
-The group with more than 12 and up to 24 months of service had **31.0%**
-observed churn, compared with **18.6%** among customers with up to six
-months. The pattern supports testing a nonlinear tenure term. Prior retention contact
-may flag customers who were already at higher risk, so these comparisons
-cannot measure whether offers worked.
+Observed churn rose from **18.6%** in the first six months to **31.0%**
+at 13–24 months, then fell to **27.4%** beyond 36 months. The focused
+model represents tenure as a curve so it can capture that change in
+direction. The screening comparison did not isolate the curve's gain
+against a linear tenure term with all other predictors held fixed.
+
+```{r monthly-revenue-distribution, fig.width=9, fig.height=4}
+recorded_revenue <- training$MonthlyRevenue[!is.na(training$MonthlyRevenue)]
+revenue_breaks <- seq(floor(min(recorded_revenue) / 10) * 10,
+                      ceiling(max(recorded_revenue) / 10) * 10, by = 10)
+revenue_hist <- hist(recorded_revenue, breaks = revenue_breaks, plot = FALSE)
+revenue_limit <- ceiling(unname(quantile(recorded_revenue, 0.99)) / 10) * 10
+visible_bins <- revenue_hist$breaks[-1] <= revenue_limit
+revenue_shares <- 100 * revenue_hist$counts / length(recorded_revenue)
+median_revenue <- median(recorded_revenue)
+revenue_ticks <- pretty(c(0, max(revenue_shares[visible_bins])))
+most_common_bin <- which.max(revenue_hist$counts)
+plot(
+  NA_real_, NA_real_, xlim = c(min(revenue_breaks), revenue_limit),
+  ylim = range(revenue_ticks), bty = "l", yaxt = "n", xaxs = "i",
+  main = sprintf("Monthly bills were most often in the $%d–$%d band",
+                 revenue_breaks[most_common_bin], revenue_breaks[most_common_bin + 1]),
+  xlab = "Recorded monthly bill (USD)", ylab = "Share of recorded bills"
+)
+abline(h = revenue_ticks, col = chart_colors[["grid"]])
+axis(2, at = revenue_ticks, labels = paste0(revenue_ticks, "%"), las = 1,
+     col = chart_colors[["grid"]])
+rect(head(revenue_hist$breaks, -1)[visible_bins], 0,
+     tail(revenue_hist$breaks, -1)[visible_bins], revenue_shares[visible_bins],
+     col = chart_colors[["blue"]], border = "white")
+abline(v = median_revenue, col = chart_colors[["baseline"]], lty = 2, lwd = 2)
+mtext(sprintf("Median: $%.2f", median_revenue), side = 3, line = 0.25,
+      adj = 1, col = chart_colors[["baseline"]], cex = 0.76)
+```
+
+The revenue chart uses $10 bins and shows bills through
+$`r revenue_limit`. Higher bills are outside the plotted range and make up
+`r sprintf("%.1f%%", 100 * mean(recorded_revenue > revenue_limit))` of recorded
+bills. Each bar's share uses all recorded bills as the denominator.
+
+### What the revenue chart shows
+
+Monthly bills were most common in the **$30–$40** range, with a median
+of **$48.27** and a long upper tail. The spread makes monthly revenue
+useful for distinguishing account value. The focused model retains
+monthly revenue as a continuous candidate, and the financial analysis
+uses it to measure observed account value. The distribution alone does
+not show how much revenue improves churn ranking.
+
+### Why retention history is excluded from prediction
+
+```{r retention-call-visual, fig.width=8, fig.height=3.3}
+retention_groups <- ifelse(training$RetentionCalls > 0, "Called", "Did not call")
+plot_churn_comparison(churn_summary(retention_groups), "Past retention callers had higher observed churn")
+```
+
+Customers who had called the retention team showed **44.6%** observed
+churn (1,313 customers), compared with **28.3%** among customers who had
+not called (36,972 customers). Two issues limit how the team can use that
+comparison.
+
+- **Timing and data leakage.** The CSV gives no dates for retention calls
+  or offer acceptance. For example, a customer might call the retention
+  team after deciding to cancel. If that call happened after the date
+  when the model would have scored the customer, using it would give the
+  historical model information the team would have had no access to then.
+  Cross-validation alone cannot catch this timing problem.
+- **Who receives retention help.** Customers already considering leaving
+  may be more likely to call or receive an offer. Their higher observed
+  churn rate may reflect their higher starting risk. Comparing churn
+  rates across these groups cannot determine whether the offers helped.
+
+`RetentionCalls`, `MadeCallToRetentionTeam`, and
+`RetentionOffersAccepted` remain descriptive fields. Using them for
+prediction would require dated records and a definition that counts only
+events already recorded at the scoring date.
 
 ### Additional churn comparisons, including tenure by equipment age
 
@@ -142,36 +321,143 @@ for (label in names(groups)) {
   print(knitr::kable(
     churn_summary(values),
     caption = tools::toTitleCase(gsub("_", " ", label)),
-    col.names = c("Group", "Customers", "Churned", "Churn (%)",
-                  "Vs. training rate (pp)")
+    col.names = c("Group", "Customers", "Share of training sample", "Churned", "Churn (%)",
+                  "Difference from training rate (percentage points)")
   ))
 }
 ```
 
 ## Device, roaming, and subscription relationships
 
-Web capability can reflect device constraints, roaming may signal a mismatch
-with the plan, and active-line counts may reflect how closely the customer
-is tied to the account. Compare churn rates before using these fields to
-rank customers. In the charts, “Yes” refers to the question in each title.
-For example, “Yes” under “Any roaming calls” means the account had recorded
-roaming activity.
+### Handset web capability
 
-```{r hypothesis-plots, fig.width=10, fig.height=4}
-plot_groups <- list(
-  "Handset web capability" = training$HandsetWebCapable,
-  "Any roaming calls" = ifelse(training$RoamingCalls > 0, "Yes", "No"),
-  "More than one active line" = ifelse(training$ActiveSubs > 1, "Yes", "No")
+A web-capable handset may reflect a different device or service experience.
+The chart compares observed churn for customers with and without that capability.
+
+```{r handset-web-churn, fig.width=8, fig.height=3.3}
+web_groups <- factor(
+  training$HandsetWebCapable,
+  levels = c("No", "Yes"),
+  labels = c("Not web capable", "Web capable")
 )
-old_par <- par(mfrow = c(1, 3))
-for (label in names(plot_groups)) {
-  summary <- churn_summary(plot_groups[[label]])
-  barplot(summary$churn_pct, names.arg = summary$group, main = label,
-          ylim = c(0, 50), ylab = "Observed churn (%)", col = "#31688E")
-  abline(h = 100 * baseline, lty = 2)
-}
+web_summary <- churn_summary(web_groups)
+plot_churn_comparison(web_summary, "Churn was higher without web capability")
+```
+
+Observed churn was **37.5%** among customers whose handsets lacked web
+capability (3,713 customers) and **27.9%** among those with web-capable
+handsets (34,572 customers). The **9.6 percentage-point gap** supports
+testing web capability as a predictor. Adding web capability alone
+increased 10% outreach lift from **1.364 to 1.401**, so the focused
+candidate retains it. The comparison cannot establish whether upgrading a
+handset changes churn risk.
+
+### Roaming activity, churn, and billing
+
+`RoamingCalls` records average monthly roaming calls, so values can be
+fractional. The first chart groups zero as no roaming and any positive
+value as recorded roaming. For example, 0 is “No roaming,” while 2 and 15
+are both “Any roaming.” Missing values remain in a separate group.
+
+```{r roaming-any, fig.width=8, fig.height=3.5}
+roaming_groups <- ifelse(training$RoamingCalls > 0, "Any roaming calls", "No roaming calls")
+plot_churn_comparison(churn_summary(roaming_groups), "Recorded roaming groups had similar churn")
+```
+
+Customers with recorded roaming activity had **28.5%** observed churn,
+compared with **28.9%** for those with no roaming calls. The missing-roaming
+group had **43.4%** churn and represented **0.3%** of the training sample.
+The near-equal rates for customers with and without recorded roaming give
+little reason to add a binary roaming flag to the focused model.
+
+#### Is churn higher at heavier roaming levels?
+
+A yes/no flag combines light and heavy roaming. The next chart separates
+positive values into ranges so differences within the roaming group are visible.
+
+```{r roaming-intensity, fig.width=8, fig.height=5}
+roaming_band <- cut(
+  training$RoamingCalls,
+  breaks = c(-Inf, 0, 1, 3, 10, Inf),
+  labels = c("No roaming", "Over 0 to 1", "Over 1 to 3", "Over 3 to 10", "Over 10")
+)
+roaming_summary <- churn_summary(roaming_band)
+plot_churn_comparison(roaming_summary, "Churn rose across positive roaming bands")
+```
+
+Among customers with recorded roaming, observed churn increased from
+**27.1%** in the lightest band to **33.7%** in the heaviest band. The
+heaviest band contained **959 customers**, or **2.5%** of the training
+sample. That concentration explains why a yes/no flag can hide the
+heavier-use pattern. Adding the raw roaming field raised 10% lift from
+**1.364 to 1.367**, so it remains in the broader challenger. The intensity
+bands were descriptive and their added predictive value remains untested.
+
+#### Does heavier roaming go with a larger bill gap?
+
+The billing gap is the recorded monthly bill minus the fixed plan charge.
+We compare its median and middle 50% within each roaming band. The chart
+uses accounts with both recorded roaming and a calculable billing gap.
+
+```{r roaming-billing-gap, fig.width=8, fig.height=4.4}
+roaming_bill_gap <- training$MonthlyRevenue - training$TotalRecurringCharge
+gap_by_roaming <- split(roaming_bill_gap, roaming_band)
+observed_gap_counts <- vapply(gap_by_roaming, function(x) sum(!is.na(x)), integer(1))
+gap_quantiles <- vapply(gap_by_roaming, quantile, numeric(3),
+                        probs = c(0.25, 0.50, 0.75), na.rm = TRUE)
+rows <- rev(seq_along(gap_by_roaming))
+positions <- seq_along(rows)
+labels <- paste0(
+  names(gap_by_roaming)[rows], "\n(n = ",
+  format(observed_gap_counts[rows], big.mark = ",", trim = TRUE), ")"
+)
+gap_ticks <- pretty(range(0, gap_quantiles))
+
+old_par <- par(mar = c(4.1, 9.5, 4.4, 1.2))
+plot(
+  gap_quantiles[2, rows], positions, type = "n", axes = FALSE, bty = "n",
+  xlim = range(gap_ticks), ylim = c(0.5, length(rows) + 0.5),
+  main = "Heavier roaming coincided with a larger billing gap",
+  xlab = "Monthly bill minus fixed charge (USD)", ylab = ""
+)
+abline(v = gap_ticks, col = chart_colors[["grid"]])
+abline(v = 0, col = chart_colors[["ink"]], lty = 2)
+axis(1, at = gap_ticks, labels = paste0("$", gap_ticks), col = chart_colors[["grid"]])
+axis(2, at = positions, labels = labels, las = 1, tick = FALSE, cex.axis = 0.85)
+segments(gap_quantiles[1, rows], positions, gap_quantiles[3, rows], positions,
+         col = chart_colors[["blue"]], lwd = 3)
+points(gap_quantiles[2, rows], positions, pch = 19, col = chart_colors[["blue"]])
+text(gap_quantiles[2, rows], positions, labels = sprintf("$%.2f", gap_quantiles[2, rows]),
+     pos = 3, offset = 0.45, cex = 0.86, col = chart_colors[["ink"]])
+mtext("Dot = median  •  Line = middle 50% of bills", side = 3, line = 0.25,
+      adj = 1, cex = 0.76, col = chart_colors[["ink"]])
 par(old_par)
 ```
+
+#### What this means
+
+The median billing gap was **$0.65** without roaming and **$35.08** in the
+heaviest roaming band. This gives the billing gap a business interpretation
+as a plan-review signal and suggests checking whether roaming adds
+information beyond billing. The limited lift gain from raw roaming
+supports leaving it outside the focused model. The gap can include
+multiple billing components.
+Without itemized bills, the analysis cannot determine how much came from
+roaming fees or whether those fees contributed to churn.
+
+### Active subscriptions and churn
+
+```{r active-line-churn, fig.width=8, fig.height=3.5}
+active_line_groups <- ifelse(training$ActiveSubs > 1, "More than one active line",
+                             "One or fewer active lines")
+plot_churn_comparison(churn_summary(active_line_groups), "Churn was slightly higher with multiple active lines")
+```
+
+Observed churn was **30.5%** for accounts with more than one active line
+and **28.1%** for accounts with one or fewer. Adding active and distinct
+subscription counts together increased 10% lift from **1.364 to 1.420**.
+The focused candidate retains both counts. The block comparison does
+not isolate the contribution of active lines alone.
 
 ## Predictor eligibility and exploration
 
@@ -194,21 +480,16 @@ and offers require verified timing. Geography, household and credit data, and
 marketing or purchasing profiles are deferred pending a documented rationale
 and eligibility review.
 
-EDA and variable selection use the same predictor definitions in
-`03_Variable_Selection.Rmd`.
+EDA and variable selection share feature definitions and field groups in
+`R/preprocessing.R`.
 
-```{r load-feature-definitions, include=FALSE}
-selection_notebook <- readLines("03_Variable_Selection.Rmd", warn = FALSE)
-feature_start <- match("```{r feature-setup}", selection_notebook)
-stopifnot(!is.na(feature_start))
-feature_end <- which(seq_along(selection_notebook) > feature_start &
-                     selection_notebook == "```")[1L]
-stopifnot(!is.na(feature_end))
-knitr::read_chunk(lines = selection_notebook, labels = "feature-setup",
-                  from = feature_start + 1L, to = feature_end - 1L)
-```
-
-```{r feature-setup, echo=FALSE}
+```{r load-feature-definitions}
+source("R/preprocessing.R")
+feature_groups <- cell2cell_feature_groups()
+benchmark <- feature_groups$benchmark
+additional_blocks <- feature_groups$additional_blocks
+alternate_fields <- feature_groups$alternate_fields
+eligible <- c(benchmark, unlist(additional_blocks, use.names = FALSE), alternate_fields)
 ```
 
 ```{r eligibility}
@@ -265,22 +546,32 @@ for (field in eligible) {
   print(knitr::kable(
     churn_summary(group),
     caption = field,
-    col.names = c("Group", "Customers", "Churned", "Churn (%)",
-                  "Vs. training rate (pp)")
+    col.names = c("Group", "Customers", "Share of training sample", "Churned", "Churn (%)",
+                  "Difference from training rate (percentage points)")
   ))
 }
 ```
 
 ## Numeric correlations and redundancy
 
-Spearman correlation compares monotonic relationships using ranks, which
-limits the influence of extreme signed billing values. Use pairwise complete
-training observations and report the sample size for each displayed pair.
-A correlation near 1 or -1 means two fields tend to move together or in
-opposite directions. We flag absolute correlations of 0.70 or more to spot
-possible overlap. For example, a combined network-friction count can repeat
-information in the separate dropped and blocked call counts. The next
-notebook tests whether a different representation improves ranking.
+Spearman correlation measures how similarly two fields **rank the same
+customers**. For example, suppose three customers have one, two, and four
+handsets and have used one, two, and three handset models. Both fields
+rank the customers in the same order, so the correlation is +1 even
+though the counts rise by different amounts. Customers with equal values
+receive the same average rank.
+
+A value near **+1** means high ranks in one field tend to go with high
+ranks in the other. A value near **−1** means high ranks tend to go with
+low ranks. A value near **0** indicates little consistent rank ordering.
+Using ranks suits this dataset because fields such as spending and call
+counts are skewed. An unusually large bill gets the highest rank without
+its dollar amount dominating the calculation.
+
+We calculate each pair using training customers with both values present.
+Sample sizes can therefore differ across pairs. An absolute correlation of
+**0.70 or more** flags possible overlap for review. The threshold is a
+screening rule, and churn is outside this calculation.
 
 ```{r correlations, fig.width=10, fig.height=9}
 numeric_fields <- eligible[vapply(training[eligible], is.numeric, logical(1))]
@@ -293,23 +584,115 @@ pairs <- data.frame(first = rownames(rho)[pair_rows[, 1]],
                     spearman = rho[pair_rows], customers = observed_pairs[pair_rows])
 knitr::kable(pairs[order(abs(pairs$spearman), decreasing = TRUE), ], digits = 3)
 
-heatmap(rho, Rowv = NA, Colv = NA, scale = "none", margins = c(12, 12),
-        col = hcl.colors(21, "Blue-Red 3"), breaks = seq(-1, 1, length.out = 22),
-        main = "Rank correlations among eligible numeric predictors")
+correlation_colors <- colorRampPalette(c("#31688E", "#F7F9F9", "#AE503B"))(25)
+field_positions <- seq_len(ncol(rho))
+old_par <- par(mar = c(11, 11, 5.6, 1.1))
+image(
+  field_positions, field_positions, t(rho[nrow(rho):1, ]),
+  zlim = c(-1, 1), col = correlation_colors, axes = FALSE,
+  xlab = "", ylab = "", main = "Rank correlations among eligible numeric predictors"
+)
+axis(1, at = field_positions, labels = colnames(rho), las = 2,
+     tick = FALSE, cex.axis = 0.64)
+axis(2, at = field_positions, labels = rev(rownames(rho)), las = 1,
+     tick = FALSE, cex.axis = 0.64)
+mtext("Blue = negative  •  White = near zero  •  Orange = positive",
+      side = 3, line = 0.25, cex = 0.76, col = chart_colors[["ink"]])
+par(old_par)
 ```
 
-The tenure comparison motivates a flexible tenure term. Subscription and
-handset counts can encode overlapping account history. Compare candidate
-blocks on shared folds before recommending any variable set. Churn groups
-describe historical associations, including for past retention contacts.
+The screen flagged **`r nrow(pairs)` predictor pairs**. The chart highlights
+pairs that directly inform the handset, network, subscription, usage, and
+billing comparisons.
 
-## Missingness and service-feature checks
+```{r correlation-spotlight, fig.width=8.5, fig.height=4.7}
+spotlight <- data.frame(
+  first = c("Handsets", "DroppedCalls", "ReceivedCalls", "UniqueSubs",
+            "MonthlyMinutes", "MonthlyRevenue", "BlockedCalls"),
+  second = c("HandsetModels", "DroppedBlockedCalls", "OffPeakCallsInOut",
+             "ActiveSubs", "ReceivedCalls", "TotalRecurringCharge", "DroppedBlockedCalls"),
+  label = c("Handsets × handset models", "Dropped calls × combined count",
+            "Received calls × off-peak calls", "Unique × active subscriptions",
+            "Monthly minutes × received calls", "Revenue × fixed charge",
+            "Blocked calls × combined count")
+)
+indices <- cbind(match(spotlight$first, rownames(rho)),
+                 match(spotlight$second, colnames(rho)))
+spotlight$correlation <- rho[indices]
+spotlight <- spotlight[order(spotlight$correlation), ]
 
-Do unavailable quarter changes identify a distinct account segment? Compare
-the missingness flags on training records and show how missingness varies by
-tenure. Differences in churn can motivate a missingness indicator. Verify
-that the flag is observable before scoring and that the data collection
-process stays consistent.
+old_par <- par(mar = c(4.3, 15.5, 4.4, 1.4))
+positions <- barplot(
+  spotlight$correlation, names.arg = spotlight$label, horiz = TRUE,
+  las = 1, xlim = c(0, 1), xaxt = "n", border = NA,
+  col = chart_colors[["blue"]], cex.names = 0.82,
+  main = "Selected pairs with strong overlap",
+  xlab = "Spearman rank correlation"
+)
+axis(1, at = seq(0, 1, 0.2), col = chart_colors[["grid"]])
+abline(v = 0.70, col = chart_colors[["baseline"]], lty = 2, lwd = 2)
+mtext("Review threshold: 0.70", side = 3, line = 0.25, adj = 1,
+      col = chart_colors[["baseline"]], cex = 0.76)
+text(spotlight$correlation / 2, positions,
+     labels = sprintf("%.3f", spotlight$correlation), col = "white", font = 2)
+par(old_par)
+```
+
+### What this means
+
+- **Handset counts.** At **0.907**, customers who rank high on handset
+  count also tend to rank high on handset model count. Both counts stay
+  in the broader challenger, while the focused model uses web capability.
+- **Network quality.** The combined count overlaps with dropped calls
+  (**0.876**) and blocked calls (**0.746**). Replacing the separate counts
+  with the combined field reduced 10% outreach lift from **1.364 to 1.347**.
+  The focused model keeps the separate counts.
+- **Subscriptions and billing.** Unique and active subscriptions rank
+  customers similarly (**0.837**), and each describes a different part of
+  the account. The focused model retains both based on the subscription-block
+  validation. Monthly revenue and the fixed plan charge also overlap
+  (**0.761**). The model uses revenue and the billing gap to express
+  account value and the difference from the fixed charge.
+
+Strong correlation identifies fields worth comparing. A decision to remove
+one also depends on what it measures and whether the alternatives change
+ranking on the shared validation folds.
+
+## Generated features
+
+The sections below explain how the derived fields relate to churn. The
+descriptive tables use training records. The feature comparisons in
+`03_Variable_Selection.Rmd` use the shared validation folds.
+
+### Churn outcome coding
+
+`churn_flag` converts the recorded outcome to **1 for Yes** and **0 for No**.
+For example, a customer who left during the recorded observation period has
+a flag of 1. Averaging the flag within a group gives that group's observed
+churn rate. In the training data, 11,033 of 38,285 customers had a flag of
+1 (28.8%). This field is the outcome used to fit and evaluate the model.
+
+**Concern.** The observation period is unverified, so the flag cannot
+support a claim about 30-day churn. It is used only as the outcome because
+it would be unavailable when scoring future customers.
+
+```{r churn-flag-visual, fig.width=6, fig.height=3.8}
+outcome_summary <- churn_summary(rep("Training sample", nrow(training)))
+plot_churn_composition(outcome_summary, "Observed outcomes in the training sample",
+                       show_baseline = FALSE)
+```
+
+### Missing usage change and customer behavior
+
+`PercChangeMinutes` compares usage across two recorded quarters.
+**`UsageChangeMissing = 1` when that value is missing and `0` when it is recorded.**
+For example, a blank usage-change field gets a 1, while a recorded change
+of zero gets a 0. The flag is created before imputation.
+
+**Business hypothesis.** Accounts without a recorded change may differ
+from accounts with complete usage history. We check whether the missing
+usage and revenue changes occur on the same accounts, compare their churn
+rates, and examine how the missingness varies with tenure.
 
 ```{r engineered-eda}
 training <- add_cell2cell_features(training)
@@ -318,33 +701,434 @@ knitr::kable(as.data.frame.matrix(with(training, table(
   `Usage change` = change_status(PercChangeMinutes),
   `Revenue change` = change_status(PercChangeRevenues)
 ))), caption = "Customer counts by usage-change status (rows) and revenue-change status (columns)")
-knitr::kable(churn_summary(change_status(training$PercChangeMinutes)),
-             caption = "Churn by whether usage change was recorded")
-knitr::kable(aggregate(cbind(customers = rep(1, nrow(training)),
-                             changes_missing = training$UsageChangeMissing),
-                       by = list(tenure = tenure), FUN = sum))
-knitr::kable(churn_summary(cut(training$InactiveSubs, c(-Inf, 0, 1, Inf))))
-knitr::kable(churn_summary(cut(training$DroppedCallRate, c(-Inf, 0, 1, 5, Inf))))
+usage_change_summary <- churn_summary(change_status(training$PercChangeMinutes))
+knitr::kable(usage_change_summary,
+             caption = "Churn by whether usage change was recorded",
+             col.names = c("Group", "Customers", "Share of training sample", "Churned", "Churn (%)",
+                           "Difference from training rate (percentage points)"))
+missing_by_tenure <- aggregate(
+  cbind(customers = rep(1, nrow(training)), changes_missing = training$UsageChangeMissing),
+  by = list(tenure = tenure), FUN = sum
+)
+knitr::kable(missing_by_tenure)
 ```
 
-The dictionary defines monthly minutes and dropped-call counts but gives no
-explicit observation window for dropped calls. Treat drops per 100 minutes
-as provisional. A missing or nonpositive denominator yields an unavailable
-rate. Unique minus active lines describes the count difference and cannot
-identify which lines disconnected or when.
+```{r missing-flag-churn-visual, fig.width=8, fig.height=3.4}
+plot_churn_comparison(usage_change_summary, "Churn was higher when usage change was missing")
+```
 
-### What this means
+```{r usage-missingness-visual, fig.width=8, fig.height=4}
+missing_pct <- 100 * missing_by_tenure$changes_missing / missing_by_tenure$customers
+overall_missing_pct <- 100 * mean(training$UsageChangeMissing)
+positions <- barplot(
+  missing_pct, names.arg = c("Up to 6", "7–12", "13–24", "25–36", "Over 36"),
+  ylim = c(0, 3), yaxt = "n", border = NA, col = chart_colors[["blue"]],
+  main = "Usage changes were more often missing at longer tenure",
+  xlab = "Months in service", ylab = "Share missing usage change"
+)
+ticks <- 0:3
+axis(2, at = ticks, labels = paste0(ticks, "%"), las = 1, col = chart_colors[["grid"]])
+abline(h = overall_missing_pct, col = chart_colors[["baseline"]], lty = 2, lwd = 2)
+mtext(sprintf("Overall training share: %.2f%%", overall_missing_pct),
+      side = 3, line = 0.25, adj = 1, col = chart_colors[["baseline"]], cex = 0.76)
+label_heights <- ifelse(abs(missing_pct - overall_missing_pct) < 0.25,
+                        pmax(missing_pct, overall_missing_pct + 0.07), missing_pct)
+text(positions, label_heights, labels = sprintf("%.2f%%", missing_pct),
+     pos = 3, font = 2, col = chart_colors[["ink"]], cex = 0.85)
+```
+
+#### What this means
 
 Both quarter changes are missing for the same 277 training customers.
 Their observed churn rate was 56.7%, compared with 28.6% for the 38,008
-customers with both changes recorded. This supports testing the missingness
-flag. It does not establish why the fields are missing.
+customers with both changes recorded. Adding the missingness flag raised
+10% lift from **1.364 to 1.412**. In the focused follow-up, it raised 10% lift from **1.435 to 1.467** and
+improved lift in every fold. It is included in the primary logistic
+handoff alongside the interaction, subject to confirming scoring-time availability.
+
+**Concern.** The flag may reflect how usage data were collected. Its
+association with churn could change if the recording process changes.
+Use at scoring depends on when the missing status becomes known.
+
+### Dropped calls relative to usage
+
+`DroppedCalls` counts interrupted calls. `MonthlyMinutes` measures usage.
+We calculate **`DroppedCallRate = 100 × DroppedCalls / MonthlyMinutes`**.
+For example, four dropped calls and 200 minutes give a rate of two per
+100 minutes. The rate is missing when either input is missing, minutes
+are zero or negative, or the drop count is negative.
+
+**Business hypothesis.** Adjusting for usage may help distinguish frequent
+interruptions from the higher number of opportunities for interruptions
+on a heavily used line. The table compares churn across rate bands.
+
+```{r dropped-call-rate, fig.width=8, fig.height=4.6}
+drop_rate_band <- cut(
+  training$DroppedCallRate,
+  breaks = c(-Inf, 0, 1, 5, Inf),
+  labels = c("0", "Over 0 to 1", "Over 1 to 5", "Over 5")
+)
+drop_rate_summary <- churn_summary(drop_rate_band)
+knitr::kable(
+  drop_rate_summary,
+  caption = "Observed churn by provisional dropped calls per 100 minutes",
+  col.names = c("Rate band", "Customers", "Share of training sample", "Churned", "Churn (%)",
+                "Difference from training rate (percentage points)"),
+  format.args = list(big.mark = ",")
+)
+plot_churn_comparison(drop_rate_summary, "Churn varied by dropped-call rate")
+```
+
+#### What this means
+
+Observed churn was **36.6%** in the highest rate band, compared with
+**26.3%** in the band above zero and up to one. The group with an unavailable
+rate had **58.7%** churn. A missing rate can result from unusable inputs, so
+that group has a distinct interpretation. The rate raised 10% lift from
+**1.373 to 1.400** compared with the model that already included dropped
+calls and monthly minutes. It remains exploratory pending confirmation
+of the measurement windows.
+
+**Concern.** The dictionary gives no explicit observation window for
+`DroppedCalls`. Interpreting the ratio as drops per 100 minutes depends on
+confirming that both fields cover comparable periods. Very low usage can
+also magnify the rate from a small number of dropped calls.
+
+### Subscription gap and customer engagement
+
+`UniqueSubs` counts distinct subscriptions associated with a customer
+account. `ActiveSubs` counts subscriptions that are currently active.
+We calculate the subscription gap as **`InactiveSubs = UniqueSubs − ActiveSubs`**.
+An account with five distinct subscriptions and three active subscriptions
+has a gap of two.
+
+**Business hypothesis.** A larger gap may signal a weaker relationship
+with Cell2Cell and higher churn risk. More active lines may reflect a
+stronger relationship with the provider. We compare observed churn in
+the training data across gaps of zero, one, and two or more lines.
+
+```{r subscription-gap, fig.width=8, fig.height=4}
+gap_band <- cut(
+  training$InactiveSubs,
+  breaks = c(-Inf, 0, 1, Inf),
+  labels = c("0 lines", "1 line", "2 or more lines")
+)
+gap_summary <- churn_summary(gap_band)
+knitr::kable(
+  gap_summary,
+  caption = "Observed churn by subscription gap in the training data",
+  col.names = c("Subscription gap", "Customers", "Share of training sample", "Churned", "Churn (%)",
+                "Difference from training rate (percentage points)"),
+  format.args = list(big.mark = ",")
+)
+plot_churn_composition(gap_summary, "Churn rose with the subscription gap")
+```
+
+Each bar represents 100% of its group. The dashed line shows the overall
+training churn rate. The labels show each group’s count (`n`) and its
+share of the training sample.
+
+#### What this means
+
+Observed churn increased from **27.9%** for accounts with no gap to
+**33.9%** for a gap of one and **37.5%** for a gap of two or more.
+Adding the gap to the benchmark increased 10% lift from **1.364 to 1.429**. In the focused follow-up, keeping active lines and replacing the other
+count with the gap reproduced the original results. Using the gap alone
+gave mixed fold results, so the handoff retains the original counts.
+
+**Concern.** The snapshot leaves the timing and reasons for inactive
+subscriptions unknown. The gap is also determined entirely by the two
+subscription counts. Including all three as linear terms would duplicate
+information in the focused model.
+
+### Nonlinear tenure and the customer relationship
+
+`MonthsInService` measures time with the carrier. The model uses
+**`splines::ns(MonthsInService, df = 3)`** to represent tenure with three
+terms that allow the churn relationship to curve. The curve is learned
+from the fitting rows of each fold.
+
+**Business hypothesis.** Churn risk may rise at some stages of the
+relationship and level off or fall at others. The tenure table in the
+Milestone 1 analysis shows observed churn of **18.6%** up to six months,
+**31.0%** above 12 through 24 months, and **27.4%** beyond 36 months.
+That pattern supports testing a curve.
+
+```{r tenure-spline-visual, fig.width=8, fig.height=4.1}
+tenure_data <- data.frame(months = training$MonthsInService, churn = churned)
+tenure_only_model <- glm(churn ~ splines::ns(months, df = 3),
+                         data = tenure_data, family = binomial())
+tenure_grid <- data.frame(months = seq(min(tenure_data$months, na.rm = TRUE),
+                                      max(tenure_data$months, na.rm = TRUE),
+                                      length.out = 200))
+fitted_churn <- 100 * predict(tenure_only_model, newdata = tenure_grid, type = "response")
+band_midpoints <- tapply(tenure_data$months, tenure, mean)
+vertical_ticks <- pretty(range(0, fitted_churn, tenure_summary$churn_pct))
+plot(tenure_grid$months, fitted_churn, type = "n", bty = "l", yaxt = "n",
+     ylim = range(vertical_ticks), xlab = "Months in service", ylab = "Churn",
+     main = "The tenure-only fit rises, falls, then rises again")
+abline(h = vertical_ticks, col = chart_colors[["grid"]])
+axis(2, at = vertical_ticks, labels = paste0(vertical_ticks, "%"), las = 1)
+add_churn_baseline()
+lines(tenure_grid$months, fitted_churn, col = chart_colors[["blue"]], lwd = 2)
+points(band_midpoints, tenure_summary$churn_pct, pch = 19, col = chart_colors[["ink"]])
+legend("bottomright", legend = c("Tenure-only fitted curve", "Observed rate by tenure band"),
+       lty = c(1, 0), pch = c(NA, 19), col = chart_colors[c("blue", "ink")],
+       cex = 0.74, bty = "n")
+```
+
+The dots use each band's average tenure and observed churn rate. The final
+dot pools all customers with more than 36 months of tenure. The late rise
+in the curve is a fitted estimate using tenure alone on the training data.
+Its predictive contribution would require a comparison with linear tenure
+on the shared validation folds.
+
+**Concern.** The fitted curve is sensitive to the smaller groups at the
+ends of the tenure range. Tenure measures elapsed time, and the data have
+no contract renewal dates to explain the shape of the curve.
+
+### Tenure and equipment age together
+
+`CurrentEquipmentDays` measures how long a customer has used the current
+handset. The interaction adds **`splines::ns(MonthsInService, df = 3):CurrentEquipmentDays`**
+alongside the existing tenure and equipment-age terms. This lets the
+association between equipment age and churn vary with tenure.
+
+**Business hypothesis.** An older handset may have a different association
+with churn for a newer customer than for a long-standing account. Each
+heatmap cell shows the churn rate within one tenure and equipment-age group.
+
+```{r tenure-equipment-heatmap, fig.width=9, fig.height=5}
+segment_counts <- table(tenure, equipment)
+segment_churned <- table(tenure[churned], equipment[churned])
+segment_rates <- ifelse(segment_counts > 0, 100 * segment_churned / segment_counts, NA)
+tenure_labels <- c("Up to 6", "7–12", "13–24", "25–36", "Over 36")
+equipment_labels <- levels(equipment)
+
+palette <- c("#A8CCBF", "#D4E7DD", "#F2EBCF", "#EFB48F", "#BF624A")
+rate_bands <- matrix(
+  cut(segment_rates - 100 * baseline,
+      breaks = c(-Inf, -8, -3, 3, 8, Inf), labels = FALSE),
+  nrow = nrow(segment_rates)
+)
+
+old_par <- par(mar = c(3.3, 6.1, 5.8, 1.2))
+plot.new()
+plot.window(xlim = c(0.5, 4.5), ylim = c(0.5, 5.5), xaxs = "i", yaxs = "i")
+for (i in seq_len(nrow(segment_counts))) {
+  row_y <- nrow(segment_counts) - i + 1
+  for (j in seq_len(ncol(segment_counts))) {
+    count <- segment_counts[i, j]
+    band <- rate_bands[i, j]
+    fill <- if (count > 0) palette[band] else "#EBEDF0"
+    ink <- if (count > 0 && band == 5L) "#FFFFFF" else "#243247"
+    rect(j - 0.47, row_y - 0.45, j + 0.47, row_y + 0.45,
+         col = fill, border = NA)
+    if (count > 0) {
+      text(j, row_y + 0.10, sprintf("%.1f%%", segment_rates[i, j]),
+           col = ink, font = 2, cex = 1.15)
+      text(j, row_y - 0.18, paste0("n = ", format(count, big.mark = ",")),
+           col = ink, cex = 0.73)
+    } else {
+      text(j, row_y, "—", col = "#626E78")
+    }
+  }
+}
+axis(3, at = seq_along(equipment_labels), labels = equipment_labels, tick = FALSE)
+axis(2, at = rev(seq_along(tenure_labels)), labels = tenure_labels,
+     tick = FALSE, las = 1)
+mtext("Equipment age (days)", side = 3, line = 1.9)
+mtext("Tenure (months)", side = 2, line = 4.3)
+title("Observed churn by tenure and equipment age", line = 3.7)
+mtext(sprintf("Training baseline: %.1f%%", 100 * baseline),
+      side = 1, line = 1.35, adj = 1, col = "#C34412", cex = 0.8)
+mtext("Green = lower churn     •     Orange = higher churn",
+      side = 1, line = 1.35, adj = 0, cex = 0.8)
+par(old_par)
+```
+
+Gray cells (—) have no observed customers. The chart omits
+`r format(sum(!complete.cases(tenure, equipment)), big.mark = ",")` training
+records missing tenure or equipment age. The middle color marks rates within
+three percentage points of the overall training baseline.
+
+#### What this means
+
+For customers with 13–24 months of tenure, observed churn was **24.9%**
+with equipment aged 0–180 days and **33.0%** at 366–730 days.
+Adding the tenure-by-equipment interaction to the benchmark increased
+10% lift from **1.364 to 1.427**. The focused follow-up kept both main effects. Adding the interaction
+alone gave mixed results across folds at 10%, while adding it alongside
+the missingness flag improved lift across every fold and cutoff. The
+primary logistic handoff includes both additions.
+
+#### Equipment age among customers with more than three years of tenure
+
+The chart isolates the last row of the heatmap. Each bar shows the observed
+churn rate for one equipment-age group within that tenure band.
+
+```{r long-tenure-equipment, fig.width=8, fig.height=3.9}
+long_tenure_row <- nrow(segment_counts)
+long_tenure_counts <- as.vector(segment_counts[long_tenure_row, ])
+long_tenure_summary <- data.frame(
+  group = paste(equipment_labels, "days"),
+  customers = long_tenure_counts,
+  training_share = sprintf("%.1f%%", 100 * long_tenure_counts / nrow(training)),
+  churn_pct = as.vector(segment_rates[long_tenure_row, ])
+)
+plot_churn_comparison(long_tenure_summary, "Churn rose with equipment age after three years")
+```
+
+Churn rose from **15.2%** for equipment aged 0–180 days (466 customers) to
+**39.0%** for equipment aged 731 days or more (726 customers), a difference
+of **23.8 percentage points**. The group with the oldest equipment was also
+the only one above the overall training churn rate of 28.8%. This
+supports retaining equipment age and screening its interaction with
+tenure. The subgroup chart alone does not establish a cutoff for outreach.
+
+**Concern.** Some combinations have few customers, so their rates are
+less stable. The interaction also adds model terms, so any improvement
+needs to hold up on validation folds. This comparison cannot establish
+whether offering an upgrade would reduce churn.
+
+### Billing gap and plan fit
+
+`MonthlyRevenue` is the recorded average monthly bill.
+`TotalRecurringCharge` is the fixed monthly plan charge. For each account,
+we subtract the fixed charge from the recorded bill.
+**`billing_gap = MonthlyRevenue − TotalRecurringCharge`** measures the
+difference in USD per month.
+
+| Recorded monthly bill | Fixed monthly charge | Calculation | Interpretation |
+| ---: | ---: | --- | --- |
+| $80 | $60 | 80 − 60 = **$20** | The bill is $20 above the fixed charge. |
+| $80 | $80 | 80 − 80 = **$0** | The bill equals the fixed charge. |
+| $50 | $60 | 50 − 60 = **−$10** | The bill is $10 below the fixed charge. |
+| Missing | $60 | **`NA`** | The gap cannot be calculated without both values. |
+
+The first two examples have the same $80 bill but different gaps because
+their plans have different fixed charges. The calculation preserves
+negative values. A gap of zero means both recorded amounts are equal.
+When either amount is missing, the gap remains `NA` in EDA. In
+cross-validation, the modeling notebook fills missing gaps using the
+median gap from the fitting rows for that fold.
+
+**Business hypothesis.** Customers whose bills differ from their fixed
+charge may have a different churn profile. The chart and summary table
+group accounts by whether the gap is below, equal to, or above zero.
+The focused model uses the signed dollar amount, so a gap of $5 and a
+gap of $50 remain different values in the model.
+
+```{r billing-gap-summary, fig.width=9, fig.height=4}
+billing_band <- factor(
+  sign(training$billing_gap),
+  levels = c(-1, 0, 1),
+  labels = c("Below fixed charge", "Equal to fixed charge", "Above fixed charge")
+)
+billing_summary <- churn_summary(billing_band)
+knitr::kable(
+  billing_summary,
+  caption = "Observed churn by billing gap direction",
+  col.names = c("Revenue versus fixed charge", "Customers", "Share of training sample", "Churned",
+                "Churn (%)", "Difference from training rate (percentage points)"),
+  format.args = list(big.mark = ",")
+)
+plot_churn_composition(billing_summary, "Churn varied with the billing gap")
+```
+
+#### What this means
+
+Observed churn was **26.0%** below the fixed charge and **30.2%** above it.
+The smaller group with equal revenue and fixed charge had **34.2%** churn.
+
+#### Why use the gap if both original fields are available?
+
+With both billing amounts observed, ordinary logistic regression with
+linear terms can represent the same relationship using either
+`MonthlyRevenue` and `TotalRecurringCharge` or `MonthlyRevenue` and
+`billing_gap`. The fixed charge can always be recovered as
+`MonthlyRevenue − billing_gap`. For example, an $80 bill and a $20 gap
+imply a $60 fixed charge.
+
+The gap makes the comparison with the plan charge easier to interpret.
+Cross-validation checks whether that representation changes outreach
+ranking under the actual preprocessing. At 10% outreach capacity, lift
+was **1.364** with the gap and **1.363** with the fixed charge. Fold-specific
+imputation can produce small differences when source amounts are missing.
+The focused model retains the gap for its business interpretation, given
+the nearly identical validation results.
+
+**Concern.** The gap can reflect multiple billing components. Identifying
+specific fees or estimating margin requires itemized billing and cost data.
+Using the gap with both original amounts as linear terms would also create
+perfect multicollinearity wherever all three values are available.
 
 ## Revenue exposure
 
-How much recorded monthly revenue is associated with historical churners?
-Compare observed revenue by churn label and by tenure, equipment age, and
-revenue tier. Report coverage so that missing revenue remains visible.
+The revenue exposure total sums recorded monthly bills for training customers
+who churned. Coverage is the share of historical churners whose bill amount
+is available.
+
+```{r revenue-headline-data, include=FALSE}
+churner_revenue <- training$MonthlyRevenue[churned]
+churner_count <- length(churner_revenue)
+observed_churner_revenue <- sum(!is.na(churner_revenue))
+missing_churner_revenue <- sum(is.na(churner_revenue))
+revenue_exposure_total <- sum(churner_revenue, na.rm = TRUE)
+revenue_coverage_pct <- 100 * observed_churner_revenue / churner_count
+outcome_medians <- c(
+  "Churned" = median(churner_revenue, na.rm = TRUE),
+  "Did not churn" = median(training$MonthlyRevenue[!churned], na.rm = TRUE)
+)
+```
+
+> **Historical monthly revenue exposure in the training sample**
+>
+> **`r sprintf("$%s", format(round(revenue_exposure_total), big.mark = ",", trim = TRUE))` USD**
+>
+> Sum of recorded monthly revenue for historical churners.
+
+```{r revenue-coverage-summary}
+knitr::kable(
+  data.frame(
+    `Historical churners` = churner_count,
+    `With recorded revenue` = observed_churner_revenue,
+    `Without recorded revenue` = missing_churner_revenue,
+    `Revenue coverage` = sprintf("%.2f%%", revenue_coverage_pct),
+    check.names = FALSE
+  ),
+  format.args = list(big.mark = ",")
+)
+```
+
+### Median monthly revenue by churn outcome
+
+```{r revenue-by-outcome-visual, fig.width=8, fig.height=3.4}
+old_par <- par(mar = c(4.2, 8.5, 4.1, 1.2))
+medians <- rev(outcome_medians)
+positions <- barplot(
+  medians, horiz = TRUE, las = 1, border = NA, xaxt = "n",
+  xlim = c(0, 60), col = chart_colors[c("blue", "high")],
+  main = "Median monthly revenue was similar across churn outcomes",
+  xlab = "Median recorded monthly revenue (USD)", cex.names = 0.9
+)
+ticks <- seq(0, 60, 10)
+axis(1, at = ticks, labels = paste0("$", ticks), col = chart_colors[["grid"]])
+text(medians / 2, positions, labels = sprintf("$%.2f", medians),
+     col = "white", font = 2)
+par(old_par)
+```
+
+#### What this means
+
+Median monthly revenue differed by about **`r sprintf("$%.2f", abs(diff(outcome_medians)))`**.
+The similar medians make a case for assessing churn risk and account value
+together when prioritizing outreach.
+
+### Revenue exposure by customer group
+
+The tables break down coverage and exposure by churn status, tenure,
+equipment age, and revenue tier.
 
 ```{r revenue-exposure, results='asis'}
 segment_groups <- list("Churn status" = ifelse(churned, "Churned", "Did not churn"),
@@ -359,6 +1143,7 @@ for (label in names(segment_groups)) {
     data.frame(
       customers = length(rows),
       revenue_observed = sum(!is.na(value)),
+      revenue_coverage = sprintf("%.1f%%", 100 * mean(!is.na(value))),
       median_revenue_usd = if (all(is.na(value))) NA_real_ else median(value, na.rm = TRUE),
       churners = sum(observed_churn),
       churners_with_revenue = sum(observed_churn & !is.na(value)),
@@ -374,24 +1159,8 @@ for (label in names(segment_groups)) {
 
 ### What this means
 
-In training, 10,980 of 11,033 historical churners had recorded monthly
-revenue, totaling about **$633,652**. Median monthly revenue was $47.24
-among churners and $48.69 among customers who stayed. These medians suggest
-using revenue to measure customer value alongside a churn score.
-
-```{r billing-gap-summary}
-knitr::kable(as.data.frame(table(
-  sign = factor(sign(training$billing_gap), levels = c(-1, 0, 1),
-                labels = c("Revenue below fixed charge", "Equal",
-                           "Revenue above fixed charge")),
-  useNA = "ifany"
-)), col.names = c("Revenue versus plan charge", "Training customers"))
-```
-
-`TotalRecurringCharge` is the fixed plan charge. `billing_gap` measures
-monthly revenue minus that charge and may include multiple billing components.
-The sum above is historical monthly revenue exposure among observed churners.
-For the financial handoff, a modeled churn probability of 0.40 paired with
+Historical revenue exposure describes the recorded bills associated with
+past churn. For the financial handoff, a modeled churn probability of 0.40 paired with
 $100 monthly revenue gives $40 of probability-weighted monthly revenue
 exposure for the modeled event. Incremental retained contribution requires
 treatment effectiveness, margin, retained duration, and outreach and offer

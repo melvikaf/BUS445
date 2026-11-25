@@ -144,6 +144,28 @@ knitr::kable(data.frame(
 ))
 ```
 
+### How cleaning changed the recorded missingness
+
+```{r missingness-visual, fig.width=8, fig.height=3.6}
+incomplete_counts <- c(sum(!complete.cases(customers)), sum(!complete.cases(prepared)))
+incomplete_pct <- 100 * incomplete_counts / nrow(customers)
+old_par <- par(mar = c(4.5, 7.4, 4.1, 1.3))
+positions <- barplot(
+  rev(incomplete_pct), horiz = TRUE, names.arg = c("After cleaning", "At import"),
+  las = 1, xlim = c(0, 100), xaxt = "n", border = NA,
+  col = c("#2B6387", "#A5BDD0"),
+  main = "More missing values were identified after recoding",
+  xlab = "Share of all customer records with at least one missing field"
+)
+ticks <- seq(0, 100, 20)
+axis(1, at = ticks, labels = paste0(ticks, "%"), col = "#DCE8F0")
+text(rev(incomplete_pct), positions,
+     labels = sprintf("%.1f%% (%s)", rev(incomplete_pct),
+                      format(rev(incomplete_counts), big.mark = ",", trim = TRUE)),
+     pos = 4, font = 2, col = "#243247", cex = 0.9)
+par(old_par)
+```
+
 ### What this means
 
 Before cleaning, `HandsetPrice` had **0 cells counted as missing** because
@@ -239,7 +261,10 @@ for (rows in train_by_churn) {
   manifest$cv_fold[rows] <- sample(rep(1:3, length.out = length(rows)))
 }
 
-stopifnot(!anyDuplicated(manifest$CustomerID),
+stopifnot(nrow(prepared) == nrow(customers),
+          identical(prepared$CustomerID, customers$CustomerID),
+          identical(prepared$MonthlyRevenue, customers$MonthlyRevenue),
+          !anyDuplicated(manifest$CustomerID),
           setequal(prepared$CustomerID, manifest$CustomerID),
           all(manifest$cv_fold[manifest$split == "train"] %in% 1:3),
           all(is.na(manifest$cv_fold[manifest$split == "test"])))
@@ -257,6 +282,29 @@ write.csv(prepared, "Generated_Data/cleaned_data.csv", row.names = FALSE, na = "
 write.csv(manifest, "Generated_Data/split_manifest.csv", row.names = FALSE, na = "")
 ```
 
+```{r split-visual, fig.width=8, fig.height=3.3}
+partition_counts <- c(length(train_rows), length(test_rows))
+partition_shares <- 100 * partition_counts / sum(partition_counts)
+positions <- barplot(
+  matrix(partition_shares, ncol = 1), horiz = TRUE,
+  xlim = c(0, 100), xaxt = "n", yaxt = "n", border = NA,
+  col = c("#2B6387", "#DCE8F0"),
+  main = "Training and reserved test assignments",
+  xlab = "Share of all customer records"
+)
+ticks <- seq(0, 100, 25)
+axis(1, at = ticks, labels = paste0(ticks, "%"), col = "#DCE8F0")
+text(cumsum(partition_shares) - partition_shares / 2, rep(positions, 2),
+     labels = sprintf("%s\n%s customers\n%.1f%%", c("Training", "Reserved test"),
+                      format(partition_counts, big.mark = ",", trim = TRUE),
+                      partition_shares),
+     col = c("white", "#243247"), font = 2, cex = 0.87)
+```
+
+The three validation folds are drawn from the training segment. The reserved
+test segment stays outside feature and model selection.
+
 The cleaned master retains all source columns for auditing and exploration.
-Use `CustomerID` to join the two files and use the eligibility review in
-`02_EDA.Rmd` before choosing predictors.
+`CustomerID` joins the master to the split manifest. The modeling notebooks
+use `R/preprocessing.R` to create temporary fold-specific copies. The master
+retains observed monthly revenue for the finance handoff.
