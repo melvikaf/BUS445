@@ -164,9 +164,3 @@ The observation window for churn remains unverified. Earlier full-file
 exploration limits the independence of the reserved test set. The team
 still needs to compare algorithms, agree on outreach capacity, verify
 scoring-time inputs, and evaluate the locked model.
-
-## AI assistance record
-
-| Tool | Use | Verification |
-| --- | --- | --- |
-| Codex | Refined the R Markdown, packaged shared preprocessing, and implemented and documented the predictor-set comparisons. | Rendered the notebooks in fresh R sessions and checked preserved split assignments, preprocessing parity, and validation results. Team review is still required before submission. |
