@@ -1,0 +1,616 @@
+---
+title: "Cell2Cell | Logistic Regression"
+output:
+html_document:
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE
+)
+```
+
+```{r}
+library(tidyverse)
+```
+
+
+## Preprocessing
+
+Use the generated_data and split manifest to get the training, validation, and test sets.
+
+```{r}
+source("R/preprocessing.R")
+
+cleaned <- read.csv("Generated_Data/cleaned_data.csv", na.strings = c("", "NA"))
+manifest <- read.csv("Generated_Data/split_manifest.csv")
+stopifnot(
+  !anyDuplicated(cleaned$CustomerID),
+  !anyDuplicated(manifest$CustomerID),
+  setequal(cleaned$CustomerID, manifest$CustomerID)
+)
+data <- cleaned[match(manifest$CustomerID, cleaned$CustomerID),]
+data$split <- manifest$split
+data$cv_fold <- manifest$cv_fold
+data <- add_cell2cell_features(data)
+
+# Separate training and test data
+training <- subset(data, split == "train")
+test <- subset(data, split == "test")
+
+stopifnot(
+  !anyNA(training$cv_fold),
+  setequal(unique(training$cv_fold), 1:3),
+  all(is.na(test$cv_fold))
+)
+
+table(training$cv_fold)
+table(training$Churn)
+
+# dimensions
+dim(training)
+dim(test)
+```
+
+There are three recommended predictor sets for the logistic regression model. I will train a model using each predictor set at each outreach capacity (0.1, 0.2, 0.3).
+
+The predictor set labelled `focused_both` contains the following variables. Among all predictor sets, MonthsInService is transformed using a natural cubic spline (df = 3). 
+
+`focused_both` contains the interaction term between `MonthsInSerive` and `CurrentEquipmentDays`.
+
+`focused_missing` contains the same features but without this interaction term.
+
+`broader_without_price` is the same set of features as before but with additional features such as handset information, usage costs and roaming, customer history, and calling activity.
+
+```{r}
+# Retrieve logistic regression predictor groups
+handoff_predictors <- cell2cell_handoff_predictors()
+logistic_terms <- handoff_predictors$logistic
+
+logistic_terms$focused_both
+logistic_terms$focused_missing
+logistic_terms$broader_without_price
+```
+
+
+```{r}
+# Three candidate models
+model_terms <- list(
+  focused_both = logistic_terms$focused_both,
+  focused_missing = logistic_terms$focused_missing,
+  broader_without_price = logistic_terms$broader_without_price
+)
+
+# Convert predictor lists into formulas
+model_formulas <- lapply(
+  model_terms,
+  function(terms) {
+    reformulate(terms, response = "churn_flag")
+  }
+)
+# View the three formulas
+# model_formulas
+```
+
+
+
+```{r}
+# All unique predictors used across the three models
+inputs <- unique(unlist(
+  lapply(unlist(model_terms, use.names = FALSE), function(term) {
+    all.vars(parse(text = term))
+  }),
+  use.names = FALSE
+))
+```
+
+
+The model is evaluated on three outreach capacities, which looks for customers in the top 10%, 20%, and 30% highest risk of churning.
+
+```{r}
+capacities <- c(0.10, 0.20, 0.30)
+
+evaluate_logistic <- function(actual,probability,customer_id,model_name,fold_id) {
+
+  outcome <- as.numeric(as.character(actual))
+  
+  positives <- sum(outcome == 1) # churned
+  negatives <- sum(outcome == 0) # did not churn
+
+  stopifnot(
+    !anyNA(outcome),
+    positives > 0,
+    negatives > 0
+  )
+  # auc formula
+  auc <- (
+    sum(rank(probability)[outcome == 1]) -
+      positives * (positives + 1) / 2
+  ) / (positives * negatives)
+  # customer ranking
+  ranked <- order(-probability, customer_id)
+
+  # Evaluate different outreach capacities
+  precision <- vapply(capacities, function(capacity) {
+    n_contact <- floor(capacity * length(ranked))
+    contacted <- head(ranked, n_contact)
+    mean(outcome[contacted] == 1)
+  }, numeric(1))
+
+  # Lift relative to overall churn rate
+  lift <- precision / mean(outcome == 1)
+
+  data.frame(
+    Model = model_name,
+    Fold = fold_id,
+    Capacity = capacities,
+    AUC = auc,
+    Precision = precision,
+    Lift = lift
+  )
+}
+```
+
+
+### Three-fold Validation Step
+
+```{r}
+fold_results <- list()
+fold_models <- list()
+
+for (fold_id in 1:3) {
+  cat("Validation fold:", fold_id, "\n")
+
+  # Split analysis and assessment data
+  analysis <- training[training$cv_fold != fold_id, ] # training fold
+  assessment <- training[training$cv_fold == fold_id, ] # validation fold
+
+  # Preprocess using analysis data only
+  processed <- prepare_cell2cell_fold(
+    analysis,
+    assessment,
+    inputs
+  )
+  analysis <- processed$analysis
+  assessment <- processed$assessment
+
+  # Fit and evaluate all three models
+  fold_results[[fold_id]] <- do.call(
+    rbind,
+    lapply(names(model_terms), function(candidate) {
+
+      formula <- model_formulas[[candidate]]
+
+      # Fit logistic regression
+      fit <- glm(
+        formula,
+        family = binomial(),
+        data = analysis,
+        na.action = na.fail
+      )
+      stopifnot(
+        fit$converged,
+        nobs(fit) == nrow(analysis)
+      )
+
+      # Predict churn probabilities
+      probability <- predict(
+        fit,
+        newdata = assessment,
+        type = "response"
+      )
+      stopifnot(
+        length(probability) == nrow(assessment),
+        all(is.finite(probability))
+      )
+
+      # Evaluate model
+      results <- evaluate_logistic(
+        actual = assessment$churn_flag,
+        probability = probability,
+        customer_id = assessment$CustomerID,
+        model_name = candidate,
+        fold_id = fold_id
+      )
+
+      # Save fitted model
+      fold_models[[paste(candidate, fold_id, sep = "_")]] <<- fit
+
+      results
+    })
+  )
+}
+
+# Combine results from all folds
+fold_scores <- do.call(rbind, fold_results)
+row.names(fold_scores) <- NULL
+fold_scores
+```
+
+
+```{r}
+cv_summary <- aggregate(
+  cbind(AUC, Precision, Lift) ~ Model + Capacity,
+  data = fold_scores,
+  FUN = mean
+)
+
+# Calculate standard deviation across folds
+cv_sd <- aggregate(
+  cbind(AUC, Precision, Lift) ~ Model + Capacity,
+  data = fold_scores,
+  FUN = sd
+)
+
+names(cv_sd)[names(cv_sd) == "AUC"] <- "AUC_SD"
+names(cv_sd)[names(cv_sd) == "Precision"] <- "Precision_SD"
+names(cv_sd)[names(cv_sd) == "Lift"] <- "Lift_SD"
+
+# Combine mean and standard deviation
+cv_summary <- merge(
+  cv_summary,
+  cv_sd,
+  by = c("Model", "Capacity")
+)
+
+cv_summary <- cv_summary[
+  order(
+    -cv_summary$Precision,
+    -cv_summary$AUC,
+    -cv_summary$Lift
+  ),
+]
+
+print(cv_summary, row.names = FALSE)
+```
+Based on the summary, focused_both model provides the highest precision and AUC at 10% outreach capacity. Let us explore this group more by training it on the full training data and validating it on the test data.
+
+### Final Logistic Regression Model
+
+```{r}
+# Preprocess full training data and reserved test data
+final_processed <- prepare_cell2cell_fold(
+  training,
+  test,
+  inputs
+)
+
+final_training <- final_processed$analysis
+final_test <- final_processed$assessment
+
+# Select focused_both
+selected_model <- "focused_both"
+
+# Fit logistic regression
+final_logit <- glm(
+  model_formulas[[selected_model]],
+  family = binomial(),
+  data = final_training,
+  na.action = na.fail
+)
+
+# Inspect model summary
+# summary(final_logit) 
+```
+
+
+```{r}
+test_results <- evaluate_logistic(
+  actual = final_test$churn_flag,
+  probability = predict(
+    final_logit,
+    newdata = final_test,
+    type = "response"
+  ),
+  customer_id = final_test$CustomerID,
+  model_name = "focused_both",
+  fold_id = "Test"
+)
+
+print(test_results, row.names = FALSE)
+```
+The results are consistent with the previous results.
+
+### Test Data
+
+```{r}
+test_predictions <- data.frame(
+  CustomerID = final_test$CustomerID,
+  Actual_Churn = final_test$Churn,
+  focused_both_Probability = predict(
+    final_logit,
+    newdata = final_test,
+    type = "response"
+  )
+)
+
+head(test_predictions)
+# saves the prediction dataframe as a csv
+#write.csv(test_predictions, file = "predicted_probabilities/logistic_predictions.csv", row.names = FALSE)
+```
+
+### Confusion Matrix
+
+```{r}
+# Get predicted probabilities
+test_probability <- predict(
+  final_logit,
+  newdata = final_test,
+  type = "response"
+)
+
+# Function to calculate confusion matrix at an outreach capacity
+get_churn_matrix <- function(actual, probability, capacity) {
+
+  # Determine probability cutoff for the selected capacity
+  cutoff <- quantile(
+    probability,
+    probs = 1 - capacity,
+    type = 1
+  )
+
+  # Rank customers by predicted probability
+  predicted <- ifelse(probability >= cutoff, 1, 0)
+
+  # Create confusion matrix
+  table(
+    Actual = factor(actual, levels = c(0, 1)),
+    Predicted = factor(predicted, levels = c(0, 1))
+  )
+}
+
+# Calculate matrices
+matrix_10 <- get_churn_matrix(
+  final_test$churn_flag,
+  test_probability,
+  0.10
+)
+
+matrix_20 <- get_churn_matrix(
+  final_test$churn_flag,
+  test_probability,
+  0.20
+)
+
+matrix_30 <- get_churn_matrix(
+  final_test$churn_flag,
+  test_probability,
+  0.30
+)
+
+# Display confusion matrices
+cat("Top 10% outreach capacity\n")
+matrix_10 # confusion matrix for 10% outreach capacity
+
+cat("Top 20% outreach capacity\n")
+matrix_20 # confusion matrix for 20% outreach capacity
+
+cat("Top 30% outreach capacity\n")
+matrix_30 # confusion matrix for 30% outreach capacity
+```
+
+# Estimated Net Revenue 
+
+The following assumptions are made:
+
+The overall training churn rate is 28.2%. The model will estimate the revenue based on four churn rates (0.15, 0.25, 0.30, 0.40).
+
+Retention success rate will range from (0.15, 0.25, 0.35, 0.45)
+
+Contact cost will range from (2, 3, 4, 5)
+
+Offer cost is the additional cost of the retention incentive given to a customer to encourage them to stay. It can be credit given to the customer, discounts, or additional service. For example, if the offer is 10 dollars off from current monthly plan cost for 3 months, then offer cost would be 30 dollars.
+
+
+```{r}
+# Fixed outreach capacity
+outreach_capacity <- 0.10
+
+# Business assumptions to test
+churn_rates <- c(0.15, 0.25, 0.30, 0.40)
+retention_success_rates <- c(0.15, 0.25, 0.35, 0.45)
+contact_costs <- c(2, 3, 4, 5)
+
+# Retention offer cost
+offer_costs <- c(0, 20, 30, 50)
+
+# Revenue projection period. This assumes that the customer will stay for the next 12 months after accepting an offer
+projection_months <- 12 
+```
+
+```{r}
+# Predict churn probabilities on the test set
+test_probability <- predict(
+  final_logit,
+  newdata = final_test,
+  type = "response"
+)
+
+# Observed churn rate in the training dataset
+sample_churn_rate <- mean(
+  as.numeric(as.character(training$churn_flag))
+)
+
+sample_churn_rate
+```
+
+Adjusts the model's predicted churn probabilities to reflect an assumed real-world churn rate.
+
+```{r}
+adjust_probabilities <- function(probability, sample_rate, target_rate) {
+
+  sample_odds <- probability / (1 - probability)
+
+  adjusted_odds <- sample_odds *
+    (target_rate / (1 - target_rate)) /
+    (sample_rate / (1 - sample_rate))
+
+  adjusted_probability <- adjusted_odds / (1 + adjusted_odds)
+
+  adjusted_probability
+}
+```
+
+
+Calculate Net Revenue for each combination of the assumptions.
+
+```{r}
+# Create all combinations of assumptions
+scenarios <- expand.grid(
+  Churn_Rate = churn_rates,
+  Retention_Success_Rate = retention_success_rates,
+  Contact_Cost = contact_costs,
+  Offer_Cost = offer_costs
+)
+
+# Customer monthly revenue
+monthly_revenue <- as.numeric(final_test$MonthlyRevenue)
+
+# Number of customers to contact
+n_contact <- floor(nrow(final_test) * outreach_capacity)
+
+# Calculate revenue for each scenario
+revenue_results <- do.call(
+  rbind,
+  lapply(seq_len(nrow(scenarios)), function(i) {
+
+    scenario <- scenarios[i, ]
+
+    # Adjust probabilities to the assumed real-world churn rate
+    adjusted_probability <- adjust_probabilities(
+      probability = test_probability,
+      sample_rate = sample_churn_rate,
+      target_rate = scenario$Churn_Rate
+    )
+
+    # Calculate expected monthly revenue at risk
+    value_at_risk <- adjusted_probability * monthly_revenue
+
+    # Rank customers by revenue at risk
+    ranked_customers <- order(
+      -value_at_risk,
+      final_test$CustomerID
+    )
+
+    # Select customers within outreach capacity
+    contacted <- head(ranked_customers, n_contact)
+
+    # Expected number of at-risk customers contacted
+    expected_at_risk <- sum(
+      adjusted_probability[contacted]
+    )
+
+    # Expected number of customers retained
+    expected_retained <- expected_at_risk *
+      scenario$Retention_Success_Rate
+
+    # Expected 12-month revenue saved
+    revenue_saved <- sum(
+      adjusted_probability[contacted] *
+        scenario$Retention_Success_Rate *
+        monthly_revenue[contacted] *
+        projection_months
+    )
+
+    # Total campaign cost
+    campaign_cost <- n_contact * (
+      scenario$Contact_Cost + scenario$Offer_Cost
+    )
+
+    # Net revenue
+    net_revenue <- revenue_saved - campaign_cost
+
+    data.frame(
+      Churn_Rate = scenario$Churn_Rate,
+      Retention_Success_Rate = scenario$Retention_Success_Rate,
+      Contact_Cost = scenario$Contact_Cost,
+      Offer_Cost = scenario$Offer_Cost,
+      Customers_Contacted = n_contact,
+      Expected_At_Risk = expected_at_risk,
+      Expected_Retained = expected_retained,
+      Revenue_Saved = revenue_saved,
+      Campaign_Cost = campaign_cost,
+      Net_Revenue = net_revenue
+    )
+  })
+)
+row.names(revenue_results) <- NULL
+```
+
+In the most obvious sense, Net Revenue is highest when Churn Rate and Retention Rate is high. There are more customers who can potentially be 'saved' by the 'offer,' The higher retention rate means that more of these customers accepted the offer. However, this is the most optimistic scenario. 
+
+```{r}
+revenue_results |>
+  arrange(desc(Net_Revenue)) |>
+  head(10)
+
+# saves the scenario dataframe as a csv
+# write.csv(revenue_results, file = "revenue_scenarios/logistic_revenue_estimates.csv", row.names = FALSE)
+```
+
+This may not be the most logical since it assumes that churn rate and retention rate is high.
+
+```{r}
+best_scenario <- revenue_results[
+  which.max(revenue_results$Net_Revenue),
+]
+
+print(best_scenario, row.names = FALSE)
+```
+
+
+```{r}
+# Average net revenue by assumed churn rate
+aggregate(
+  Net_Revenue ~ Churn_Rate,
+  data = revenue_results,
+  FUN = mean
+)
+
+# Average net revenue by retention success rate
+aggregate(
+  Net_Revenue ~ Retention_Success_Rate,
+  data = revenue_results,
+  FUN = mean
+)
+
+# Average net revenue by contact cost
+aggregate(
+  Net_Revenue ~ Contact_Cost,
+  data = revenue_results,
+  FUN = mean
+)
+
+# Average net revenue by offer cost
+aggregate(
+  Net_Revenue ~ Offer_Cost,
+  data = revenue_results,
+  FUN = mean
+)
+```
+
+
+```{r}
+library(ggplot2)
+
+ggplot(
+  revenue_results,
+  aes(
+    x = factor(Churn_Rate),
+    y = Net_Revenue,
+    fill = factor(Retention_Success_Rate)
+  )
+) +
+  geom_col(position = "dodge") +
+  facet_wrap(~ Contact_Cost) +
+  labs(
+    title = "Estimated 12-Month Net Revenue (Logistic Regression)",
+    x = "Assumed Real-World Churn Rate",
+    y = "Estimated Net Revenue ($)",
+    fill = "Retention Success Rate"
+  ) +
+  theme_minimal()
+```
+

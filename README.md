@@ -204,7 +204,7 @@ scoring-time inputs, and evaluate the locked model.
 Follow the same workflow for the Random Forest model:
 
 1. Train and compare the models using 3-fold cross-validation at 10%, 20%, and 30% outreach capacity.
-2. Select the best model based on AUC and precision.
+2. Select the best model based on AUC and precision. The chosen model is `broader_raw`.
 3. Train the selected model using the entire training set and evaluate it on the test set at 10% outreach capacity.
 4. Save the test predictions in `predicted_probabilities`.
 5. Run the same 256 revenue scenarios using the same business assumptions.
