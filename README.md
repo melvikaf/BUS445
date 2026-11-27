@@ -164,3 +164,49 @@ The observation window for churn remains unverified. Earlier full-file
 exploration limits the independence of the reserved test set. The team
 still needs to compare algorithms, agree on outreach capacity, verify
 scoring-time inputs, and evaluate the locked model.
+
+# Modelling Workflow
+
+## Logistic Regression
+
+1. **Train and compare models:** Use the three predictor sets from `preprocessing.R` to train three logistic regression models. Evaluate each model using 3-fold cross-validation at 10%, 20%, and 30% outreach capacity.
+
+2. **Select the best model:** Compare the models based on AUC and precision. The selected model is `focused_both`.
+
+3. **Train and test the final model:** Train `focused_both` using the entire training set with a 10% outreach capacity, then evaluate it on the test set.
+
+4. **Save predictions:** The predicted churn probabilities are saved in `predicted_probabilities/logistic_predictions.csv`. Open this file to see each test customer's predicted churn probability and whether they actually churned.
+
+5. **Estimate revenue:** Use the final model to estimate revenue under different business assumptions:
+
+   ```r
+   # Fixed outreach capacity
+   outreach_capacity <- 0.10
+
+   # Business assumptions to test
+   churn_rates <- c(0.15, 0.25, 0.30, 0.40)
+   retention_success_rates <- c(0.15, 0.25, 0.35, 0.45)
+   contact_costs <- c(2, 3, 4, 5)
+
+   # Retention offer cost
+   offer_costs <- c(0, 20, 30, 50)
+
+   # Revenue projection period (months)
+   projection_months <- 12
+   ```
+
+   The revenue analysis tests all possible combinations of these assumptions, resulting in **256 scenarios**.
+
+   The results are saved in `revenue_scenarios/logistic_revenue_estimates.csv`. Open this file to compare the estimated revenue across scenarios.
+
+## Random Forest
+
+Follow the same workflow for the Random Forest model:
+
+1. Train and compare the models using 3-fold cross-validation at 10%, 20%, and 30% outreach capacity.
+2. Select the best model based on AUC and precision.
+3. Train the selected model using the entire training set and evaluate it on the test set at 10% outreach capacity.
+4. Save the test predictions in `predicted_probabilities`.
+5. Run the same 256 revenue scenarios using the same business assumptions.
+
+The Random Forest revenue results are saved in `revenue_scenarios`.
