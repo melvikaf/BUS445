@@ -1,0 +1,702 @@
+---
+title: "Cell2Cell | Random Forest"
+output:
+html_document:
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE
+)
+```
+
+
+```{r}
+library(randomForest)
+library(tidyverse)
+```
+
+
+## Preprocessing
+
+Use the generated_data and split manifest to get the training, validation, and test sets.
+
+```{r}
+source("R/preprocessing.R")
+
+cleaned <- read.csv("Generated_Data/cleaned_data.csv", na.strings = c("", "NA"))
+manifest <- read.csv("Generated_Data/split_manifest.csv")
+
+stopifnot(
+  !anyDuplicated(cleaned$CustomerID),
+  !anyDuplicated(manifest$CustomerID),
+  setequal(cleaned$CustomerID, manifest$CustomerID)
+)
+
+data <- cleaned[match(manifest$CustomerID, cleaned$CustomerID), ]
+data$split <- manifest$split
+data$cv_fold <- manifest$cv_fold
+data <- add_cell2cell_features(data)
+
+# Separate training and test data
+training <- subset(data, split == "train")
+test <- subset(data, split == "test")
+
+stopifnot(
+  !anyNA(training$cv_fold),
+  setequal(unique(training$cv_fold), 1:3),
+  all(is.na(test$cv_fold))
+)
+
+table(training$cv_fold)
+table(training$Churn)
+
+# dimensions
+dim(training)
+dim(test)
+```
+
+
+There are two recommended predictor sets for the random forest model. 
+
+```{r}
+handoff_predictors <- cell2cell_handoff_predictors()
+forest_terms <- handoff_predictors$forest
+
+model_terms <- list(
+  focused_raw = forest_terms$focused_raw,
+  broader_raw = forest_terms$broader_raw
+)
+
+# All unique predictors used across the two models
+inputs <- unique(unlist(model_terms, use.names = FALSE))
+
+# Check that all predictors exist
+stopifnot(
+  all(inputs %in% names(training)),
+  all(inputs %in% names(test))
+)
+```
+
+Train the model using the three outreach capacities like in the logistic regression model.
+
+```{r}
+capacities <- c(0.10, 0.20, 0.30)
+
+evaluate_forest <- function(actual, probability, customer_id, model_name, fold_id) {
+
+  outcome <- as.numeric(as.character(actual))
+
+  positives <- sum(outcome == 1)
+  negatives <- sum(outcome == 0)
+
+  stopifnot(
+    !anyNA(outcome),
+    positives > 0,
+    negatives > 0
+  )
+
+  # Calculate AUC
+  auc <- (
+    sum(rank(probability)[outcome == 1]) -
+      positives * (positives + 1) / 2
+  ) / (positives * negatives)
+
+  # Rank customers by predicted churn probability
+  ranked <- order(-probability, customer_id)
+
+  # Evaluate different outreach capacities
+  precision <- vapply(capacities, function(capacity) {
+    n_contact <- floor(capacity * length(ranked))
+    contacted <- head(ranked, n_contact)
+    mean(outcome[contacted] == 1)
+  }, numeric(1))
+
+  # Calculate lift
+  lift <- precision / mean(outcome == 1)
+
+  data.frame(
+    Model = model_name,
+    Fold = fold_id,
+    Capacity = capacities,
+    AUC = auc,
+    Precision = precision,
+    Lift = lift
+  )
+}
+```
+
+### Three-fold Cross Validation
+
+This will train the model at each capacity for each fold. This may take a while to run.
+
+```{r}
+fold_results <- list()
+fold_models <- list()
+
+for (fold_id in 1:3) {
+
+  cat("Validation fold:", fold_id, "\n")
+
+  # Split analysis and assessment data
+  analysis <- training[training$cv_fold != fold_id, ]
+  assessment <- training[training$cv_fold == fold_id, ]
+
+  # Preprocess using analysis data only
+  processed <- prepare_cell2cell_fold(
+    analysis,
+    assessment,
+    inputs
+  )
+
+  analysis <- processed$analysis
+  assessment <- processed$assessment
+
+  # Fit and evaluate both Random Forest models
+  fold_results[[fold_id]] <- do.call(
+    rbind,
+    lapply(names(model_terms), function(candidate) {
+
+      predictors <- model_terms[[candidate]]
+
+      # Set churn outcome as a factor
+      outcome <- factor(
+        as.character(analysis$churn_flag),
+        levels = c("0", "1")
+      )
+
+      # Fit Random Forest
+      set.seed(123 + fold_id)
+
+      fit <- randomForest(
+        x = analysis[, predictors, drop = FALSE],
+        y = outcome,
+        ntree = 500,
+        importance = TRUE
+      )
+
+      # Predict churn probabilities
+      probability <- predict(
+        fit,
+        newdata = assessment[, predictors, drop = FALSE],
+        type = "prob"
+      )[, "1"]
+
+      stopifnot(
+        length(probability) == nrow(assessment),
+        all(is.finite(probability))
+      )
+
+      # Evaluate model
+      results <- evaluate_forest(
+        actual = assessment$churn_flag,
+        probability = probability,
+        customer_id = assessment$CustomerID,
+        model_name = candidate,
+        fold_id = fold_id
+      )
+
+      # Save fitted model
+      fold_models[[paste(candidate, fold_id, sep = "_")]] <<- fit
+
+      results
+    })
+  )
+}
+
+# Combine results from all folds
+fold_scores <- do.call(rbind, fold_results)
+
+row.names(fold_scores) <- NULL
+
+fold_scores
+```
+
+Summarize the model's performance across the three cross validation folds.
+
+```{r}
+cv_summary <- aggregate(
+  cbind(AUC, Precision, Lift) ~ Model + Capacity,
+  data = fold_scores,
+  FUN = mean
+)
+
+# Calculate standard deviation across folds
+cv_sd <- aggregate(
+  cbind(AUC, Precision, Lift) ~ Model + Capacity,
+  data = fold_scores,
+  FUN = sd
+)
+
+names(cv_sd)[names(cv_sd) == "AUC"] <- "AUC_SD"
+names(cv_sd)[names(cv_sd) == "Precision"] <- "Precision_SD"
+names(cv_sd)[names(cv_sd) == "Lift"] <- "Lift_SD"
+
+# Combine mean and standard deviation
+cv_summary <- merge(
+  cv_summary,
+  cv_sd,
+  by = c("Model", "Capacity")
+)
+
+cv_summary <- cv_summary[
+  order(
+    cv_summary$Capacity,
+    -cv_summary$Precision,
+    -cv_summary$AUC,
+    -cv_summary$Lift
+  ),
+]
+
+row.names(cv_summary) <- NULL
+
+print(cv_summary, row.names = FALSE)
+```
+
+This chooses the model with the highest Precision and AUC score from the previous summary. The selected model used the predictor set labelled `broader_raw`
+
+```{r}
+# Average precision across outreach capacities
+model_precision <- aggregate(
+  Precision ~ Model,
+  data = cv_summary,
+  FUN = mean
+)
+
+# Average AUC across outreach capacities
+model_auc <- aggregate(
+  AUC ~ Model,
+  data = cv_summary,
+  FUN = mean
+)
+
+model_comparison <- merge(
+  model_precision,
+  model_auc,
+  by = "Model"
+)
+
+model_comparison <- model_comparison[
+  order(
+    -model_comparison$Precision,
+    -model_comparison$AUC
+  ),
+]
+
+print(model_comparison, row.names = FALSE)
+
+# Select the best model
+selected_model <- model_comparison$Model[1]
+
+cat("Selected model:", selected_model, "\n")
+```
+### Final Random Forest Model
+
+This trains the final model using the chosen set of predictors on the entire training set.
+
+```{r}
+# Define saved model paths
+model_path <- "models/final_forest.rds"
+predictors_path <- "models/selected_predictors.rds"
+processed_path <- "models/final_processed.rds"
+
+# Check if all saved files exist
+if (all(file.exists(
+  model_path,
+  predictors_path,
+  processed_path
+))) {
+
+  cat("Saved model files found. Loading...\n")
+
+  # Load saved files
+  final_forest <- readRDS(model_path)
+  selected_predictors <- readRDS(predictors_path)
+  final_processed <- readRDS(processed_path)
+
+  final_training <- final_processed$analysis
+  final_test <- final_processed$assessment
+
+  cat("Saved model loaded successfully.\n")
+
+} else {
+
+  cat("Saved model files not found. Training final model...\n")
+
+  # Get predictors for the selected model
+  selected_predictors <- model_terms[[selected_model]]
+
+  selected_inputs <- selected_predictors
+
+  # Preprocess full training data and reserved test data
+  final_processed <- prepare_cell2cell_fold(
+    training,
+    test,
+    selected_inputs
+  )
+
+  final_training <- final_processed$analysis
+  final_test <- final_processed$assessment
+
+  # Set churn outcome as a factor
+  final_outcome <- factor(
+    as.character(final_training$churn_flag),
+    levels = c("0", "1")
+  )
+
+  # Fit final Random Forest model
+  set.seed(123)
+
+  cat("Training the final random forest model...\n")
+
+  final_forest <- randomForest(
+    x = final_training[, selected_predictors, drop = FALSE],
+    y = final_outcome,
+    ntree = 500,
+    importance = TRUE
+  )
+
+  # Save model files
+  dir.create("models", showWarnings = FALSE)
+
+  saveRDS(final_forest, model_path)
+  saveRDS(selected_predictors, predictors_path)
+  saveRDS(final_processed, processed_path)
+
+  cat("Model and preprocessing results saved.\n")
+}
+
+# Inspect model
+print(final_forest)
+```
+
+If you want to load the model but do not want to retrain it. Set `eval=TRUE` and run the following chunk.
+
+```{r, eval=FALSE}
+final_forest <- readRDS("models/final_forest.rds")
+selected_predictors <- readRDS("models/selected_predictors.rds")
+final_processed <- readRDS("models/final_processed.rds")
+final_training <- final_processed$analysis
+final_test <- final_processed$assessment
+```
+
+
+### Test Data
+
+Validate performance using the test data.
+
+```{r}
+test_probability <- predict(
+  final_forest,
+  newdata = final_test[, selected_predictors, drop = FALSE],
+  type = "prob"
+)[, "1"]
+
+test_results <- evaluate_forest(
+  actual = final_test$churn_flag,
+  probability = test_probability,
+  customer_id = final_test$CustomerID,
+  model_name = selected_model,
+  fold_id = "Test"
+)
+
+print(test_results, row.names = FALSE)
+```
+
+
+```{r}
+test_predictions_rf <- data.frame(
+  CustomerID = final_test$CustomerID,
+  Actual_Churn = final_test$Churn,
+  Churn_Probability = test_probability
+)
+head(test_predictions_rf)
+
+# saves the prediction dataframe as a csv
+#write.csv(test_predictions_rf, file = "predicted_probabilities/forest_predictions.csv", row.names = FALSE)
+```
+
+### Confusion Matrix
+
+```{r}
+get_churn_matrix <- function(actual, probability, customer_id, capacity) {
+
+  outcome <- as.numeric(as.character(actual))
+
+  n <- length(probability)
+  n_contact <- floor(n * capacity)
+
+  # Rank customers by predicted probability
+  ranked <- order(-probability, customer_id)
+
+  # Select the top customers
+  predicted <- rep(0, n)
+  predicted[head(ranked, n_contact)] <- 1
+
+  # Generate confusion matrix
+  table(
+    Actual = factor(outcome, levels = c(0, 1)),
+    Predicted = factor(predicted, levels = c(0, 1))
+  )
+}
+```
+
+
+```{r}
+matrix_10 <- get_churn_matrix(
+  actual = final_test$churn_flag,
+  probability = test_probability,
+  customer_id = final_test$CustomerID,
+  capacity = 0.10
+)
+
+matrix_20 <- get_churn_matrix(
+  actual = final_test$churn_flag,
+  probability = test_probability,
+  customer_id = final_test$CustomerID,
+  capacity = 0.20
+)
+
+matrix_30 <- get_churn_matrix(
+  actual = final_test$churn_flag,
+  probability = test_probability,
+  customer_id = final_test$CustomerID,
+  capacity = 0.30
+)
+
+# Display confusion matrices
+cat("Top 10% outreach capacity\n")
+matrix_10
+
+cat("Top 20% outreach capacity\n")
+matrix_20
+
+cat("Top 30% outreach capacity\n")
+matrix_30
+```
+### Variable Importance
+
+```{r}
+importance(final_forest)
+
+varImpPlot(
+  final_forest,
+  main = paste("Variable Importance -", selected_model)
+)
+```
+
+
+# Estimated Net Revenue
+
+```{r}
+# Fixed outreach capacity
+outreach_capacity <- 0.10
+
+# Business assumptions to test
+churn_rates <- c(0.15, 0.25, 0.30, 0.40)
+retention_success_rates <- c(0.15, 0.25, 0.35, 0.45)
+contact_costs <- c(2, 3, 4, 5)
+
+# Retention offer cost
+offer_costs <- c(0, 20, 30, 50)
+
+# Revenue projection period. This assumes that the customer will stay for the next 12 months after accepting an offer
+projection_months <- 12
+```
+
+
+```{r}
+# Predict churn probabilities on the test set
+test_probability <- predict(
+  final_forest,
+  newdata = final_test[, selected_predictors, drop = FALSE],
+  type = "prob"
+)[, "1"]
+
+# Observed churn rate in the training dataset
+sample_churn_rate <- mean(
+  as.numeric(as.character(training$churn_flag))
+)
+
+sample_churn_rate
+```
+
+Adjusts the model's predicted churn probabilities to reflect an assumed real-world churn rate.
+
+```{r}
+adjust_probabilities <- function(probability, sample_rate, target_rate) {
+
+  sample_odds <- probability / (1 - probability)
+
+  adjusted_odds <- sample_odds *
+    (target_rate / (1 - target_rate)) /
+    (sample_rate / (1 - sample_rate))
+
+  adjusted_probability <- adjusted_odds / (1 + adjusted_odds)
+
+  adjusted_probability
+}
+```
+
+Calculate Net Revenue for each combination of the assumptions.
+
+```{r}
+# Create all combinations of assumptions
+scenarios <- expand.grid(
+  Churn_Rate = churn_rates,
+  Retention_Success_Rate = retention_success_rates,
+  Contact_Cost = contact_costs,
+  Offer_Cost = offer_costs
+)
+
+# Customer monthly revenue
+monthly_revenue <- as.numeric(final_test$MonthlyRevenue)
+
+# Number of customers to contact
+n_contact <- floor(nrow(final_test) * outreach_capacity)
+
+# Calculate revenue for each scenario
+revenue_results_rf <- do.call(
+  rbind,
+  lapply(seq_len(nrow(scenarios)), function(i) {
+
+    scenario <- scenarios[i, ]
+
+    # Adjust probabilities to the assumed real-world churn rate
+    adjusted_probability <- adjust_probabilities(
+      probability = test_probability,
+      sample_rate = sample_churn_rate,
+      target_rate = scenario$Churn_Rate
+    )
+
+    # Calculate monthly revenue at risk
+    value_at_risk <- adjusted_probability * monthly_revenue
+
+    # Rank customers by revenue at risk
+    ranked_customers <- order(
+      -value_at_risk,
+      final_test$CustomerID
+    )
+
+    # Select customers within outreach capacity
+    contacted <- head(ranked_customers, n_contact)
+
+    # Expected number of at-risk customers contacted
+    expected_at_risk <- sum(
+      adjusted_probability[contacted]
+    )
+
+    # Expected number of customers retained
+    expected_retained <- expected_at_risk *
+      scenario$Retention_Success_Rate
+
+    # Expected 12-month revenue saved
+    revenue_saved <- sum(
+      adjusted_probability[contacted] *
+        scenario$Retention_Success_Rate *
+        monthly_revenue[contacted] *
+        projection_months
+    )
+
+    # Total campaign cost
+    campaign_cost <- n_contact * (
+      scenario$Contact_Cost + scenario$Offer_Cost
+    )
+    
+    # Net revenue
+    net_revenue <- revenue_saved - campaign_cost
+
+    data.frame(
+      Churn_Rate = scenario$Churn_Rate,
+      Retention_Success_Rate = scenario$Retention_Success_Rate,
+      Contact_Cost = scenario$Contact_Cost,
+      Offer_Cost = scenario$Offer_Cost,
+      Customers_Contacted = n_contact,
+      Expected_At_Risk = expected_at_risk,
+      Expected_Retained = expected_retained,
+      Revenue_Saved = revenue_saved,
+      Campaign_Cost = campaign_cost,
+      Net_Revenue = net_revenue
+    )
+  })
+)
+
+row.names(revenue_results_rf) <- NULL
+```
+
+Similar to the logistic regression, Net Revenue is highest when churn rate and retention success rate is high
+
+```{r}
+revenue_results_rf |>
+  arrange(desc(Net_Revenue)) |>
+  head(10)
+
+# saves the scenario dataframe as a csv
+#write.csv(revenue_results_rf, file = "revenue_scenarios/forest_revenue_estimates.csv", row.names = FALSE)
+```
+
+
+
+```{r}
+best_scenario_rf <- revenue_results_rf[
+  which.max(revenue_results_rf$Net_Revenue),
+]
+print(best_scenario_rf, row.names = FALSE)
+```
+
+
+```{r}
+# Average net revenue by assumed churn rate
+aggregate(
+  Net_Revenue ~ Churn_Rate,
+  data = revenue_results_rf,
+  FUN = mean
+)
+
+# Average net revenue by retention success rate
+aggregate(
+  Net_Revenue ~ Retention_Success_Rate,
+  data = revenue_results_rf,
+  FUN = mean
+)
+
+# Average net revenue by contact cost
+aggregate(
+  Net_Revenue ~ Contact_Cost,
+  data = revenue_results_rf,
+  FUN = mean
+)
+
+# Average net revenue by offer cost
+aggregate(
+  Net_Revenue ~ Offer_Cost,
+  data = revenue_results_rf,
+  FUN = mean
+)
+```
+
+
+```{r}
+library(ggplot2)
+
+ggplot(
+  revenue_results_rf,
+  aes(
+    x = factor(Churn_Rate),
+    y = Net_Revenue,
+    fill = factor(Retention_Success_Rate)
+  )
+) +
+  geom_col(position = "dodge") +
+  facet_wrap(~ Contact_Cost) +
+  labs(
+    title = "Estimated 12-Month Net Revenue (Random Forest)",
+    x = "Assumed Real-World Churn Rate",
+    y = "Estimated Net Revenue ($)",
+    fill = "Retention Success Rate"
+  ) +
+  theme_minimal()
+```
+
